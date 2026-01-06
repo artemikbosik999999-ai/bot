@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 import os
 import json
 import asyncio
@@ -7,23 +9,17 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message, InlineKeyboardButton, CallbackQuery, Chat, ChatMemberUpdated
+from aiogram.types import Message, InlineKeyboardButton, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ChatMemberStatus, ChatType
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.storage.memory import MemoryStorage
 
 # =================== КОНСТАНТЫ ===================
-# Безопасная загрузка из настроек Bothost
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OWNER_ID = int(os.environ.get("OWNER_ID", "7119681628"))
 CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "artem_bori")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# Проверка токена
 if not BOT_TOKEN:
     print("❌ ОШИБКА: BOT_TOKEN не установлен!")
-    print("Добавьте в настройках Bothost:")
-    print("BOT_TOKEN = ваш_токен_бота")
     exit(1)
 
 FARM_COMMANDS = {
@@ -37,89 +33,41 @@ FARM_COMMANDS = {
 # =================== БАЗА ДАННЫХ ===================
 class Database:
     def __init__(self):
-        # Bothost дает REDIS_URL
         redis_url = os.environ.get("REDIS_URL")
-        
         if redis_url:
             try:
-                self.redis = redis.from_url(
-                    redis_url,
-                    decode_responses=True,
-                    socket_connect_timeout=5
-                )
+                self.redis = redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=5)
                 self.redis.ping()
-                print("✅ Redis Bothost подключен")
-            except Exception as e:
-                print(f"⚠️ Redis ошибка: {e}, использую память")
+                print("✅ Redis подключен")
+            except:
                 self.memory_db = {}
                 self.redis = None
         else:
-            try:
-                self.redis = redis.Redis(
-                    host='localhost',
-                    port=6379,
-                    db=0,
-                    decode_responses=True,
-                    socket_connect_timeout=5
-                )
-                self.redis.ping()
-                print("✅ Локальный Redis подключен")
-            except:
-                print("⚠️ Redis не найден, использую память")
-                self.memory_db = {}
-                self.redis = None
-    
-    def _get_key(self, user_id: int) -> str:
-        return f"user:{user_id}"
-    
-    def _get_chat_key(self, chat_id: int) -> str:
-        return f"chat:{chat_id}"
-    
-    def _get_stats_key(self) -> str:
-        return "bot_stats"
+            self.memory_db = {}
+            self.redis = None
     
     def get_user_data(self, user_id: int) -> Dict[str, Any]:
         if self.redis:
-            data = self.redis.get(self._get_key(user_id))
+            data = self.redis.get(f"user:{user_id}")
             return json.loads(data) if data else self._default_user_data()
         else:
             return self.memory_db.get(user_id, self._default_user_data())
     
     def save_user_data(self, user_id: int, data: Dict[str, Any]):
         if self.redis:
-            self.redis.set(self._get_key(user_id), json.dumps(data))
+            self.redis.set(f"user:{user_id}", json.dumps(data))
         else:
             self.memory_db[user_id] = data
     
-    def get_chat_data(self, chat_id: int) -> Dict[str, Any]:
-        if self.redis:
-            data = self.redis.get(self._get_chat_key(chat_id))
-            return json.loads(data) if data else self._default_chat_data()
-        else:
-            return self.memory_db.get(f"chat_{chat_id}", self._default_chat_data())
-    
-    def save_chat_data(self, chat_id: int, data: Dict[str, Any]):
-        if self.redis:
-            self.redis.set(self._get_chat_key(chat_id), json.dumps(data))
-        else:
-            self.memory_db[f"chat_{chat_id}"] = data
-    
     def update_chat_stats(self, chat_id: int, chat_title: str = None, chat_type: str = None):
-        """Обновить статистику чата"""
         chat_data = self.get_chat_data(chat_id)
-        
-        if chat_title:
-            chat_data['title'] = chat_title
-        if chat_type:
-            chat_data['type'] = chat_type
-        
+        if chat_title: chat_data['title'] = chat_title
+        if chat_type: chat_data['type'] = chat_type
         chat_data['last_activity'] = datetime.now().isoformat()
         chat_data['message_count'] = chat_data.get('message_count', 0) + 1
-        
         self.save_chat_data(chat_id, chat_data)
     
     def get_all_chats(self) -> Dict[int, Dict[str, Any]]:
-        """Получить все чаты где был бот"""
         if self.redis:
             chats = {}
             for key in self.redis.keys("chat:*"):
@@ -127,98 +75,38 @@ class Database:
                 chats[chat_id] = json.loads(self.redis.get(key))
             return chats
         else:
-            chats = {}
-            for key, value in self.memory_db.items():
-                if key.startswith("chat_"):
-                    chat_id = int(key.replace("chat_", ""))
-                    chats[chat_id] = value
-            return chats
-    
-    def get_bot_stats(self) -> Dict[str, Any]:
-        """Получить общую статистику бота"""
-        if self.redis:
-            data = self.redis.get(self._get_stats_key())
-            return json.loads(data) if data else self._default_bot_stats()
-        else:
-            return self.memory_db.get("bot_stats", self._default_bot_stats())
-    
-    def update_bot_stats(self, stats: Dict[str, Any]):
-        """Обновить статистику бота"""
-        if self.redis:
-            self.redis.set(self._get_stats_key(), json.dumps(stats))
-        else:
-            self.memory_db["bot_stats"] = stats
-    
-    def increment_stat(self, stat_name: str, amount: int = 1):
-        """Увеличить статистический показатель"""
-        stats = self.get_bot_stats()
-        stats[stat_name] = stats.get(stat_name, 0) + amount
-        self.update_bot_stats(stats)
+            return {k: v for k, v in self.memory_db.items() if isinstance(k, str) and k.startswith("chat_")}
     
     def _default_user_data(self):
         return {
-            'balance': 0.0,
-            'star_power': 0,
-            'productivity': 1.31,
-            'luck': 1.0,
-            'temp_luck': None,
-            'temp_luck_value': None,
-            'temp_luck_end': None,
-            'subscription': None,
-            'subscription_end': None,
-            'is_permanent': False,
-            'cooldowns': {},
-            'total_earned': 0,
-            'is_banned': False,
-            'channel_check': False,
-            'event_bonus': None,
+            'balance': 0.0, 'star_power': 0, 'productivity': 1.31, 'luck': 1.0,
+            'temp_luck': None, 'temp_luck_value': None, 'temp_luck_end': None,
+            'subscription': None, 'subscription_end': None, 'is_permanent': False,
+            'cooldowns': {}, 'total_earned': 0, 'is_banned': False,
+            'channel_check': False, 'event_bonus': None,
         }
     
     def _default_chat_data(self):
-        return {
-            'title': None,
-            'type': None,
-            'last_activity': datetime.now().isoformat(),
-            'message_count': 0,
-            'created_at': datetime.now().isoformat(),
-        }
+        return {'title': None, 'type': None, 'last_activity': datetime.now().isoformat(), 'message_count': 0, 'created_at': datetime.now().isoformat()}
     
-    def _default_bot_stats(self):
-        return {
-            'total_users': 0,
-            'active_users': 0,
-            'total_messages': 0,
-            'total_farm_commands': 0,
-            'total_balance': 0,
-            'chats_count': 0,
-            'groups_count': 0,
-            'supergroups_count': 0,
-            'channels_count': 0,
-            'start_time': datetime.now().isoformat(),
-        }
+    def get_chat_data(self, chat_id: int) -> Dict[str, Any]:
+        if self.redis:
+            data = self.redis.get(f"chat:{chat_id}")
+            return json.loads(data) if data else self._default_chat_data()
+        else:
+            return self.memory_db.get(f"chat_{chat_id}", self._default_chat_data())
+    
+    def save_chat_data(self, chat_id: int, data: Dict[str, Any]):
+        if self.redis:
+            self.redis.set(f"chat:{chat_id}", json.dumps(data))
+        else:
+            self.memory_db[f"chat_{chat_id}"] = data
     
     def update_balance(self, user_id: int, amount: float):
         data = self.get_user_data(user_id)
         data['balance'] = round(data['balance'] + amount, 2)
-        if amount > 0:
-            data['total_earned'] = round(data.get('total_earned', 0) + amount, 2)
-            # Обновляем общий баланс в статистике
-            stats = self.get_bot_stats()
-            stats['total_balance'] = stats.get('total_balance', 0) + amount
-            self.update_bot_stats(stats)
+        if amount > 0: data['total_earned'] = round(data.get('total_earned', 0) + amount, 2)
         self.save_user_data(user_id, data)
-    
-    def set_balance(self, user_id: int, amount: float):
-        data = self.get_user_data(user_id)
-        old_balance = data.get('balance', 0)
-        data['balance'] = round(amount, 2)
-        self.save_user_data(user_id, data)
-        
-        # Обновляем общий баланс
-        stats = self.get_bot_stats()
-        current_total = stats.get('total_balance', 0)
-        stats['total_balance'] = current_total - old_balance + amount
-        self.update_bot_stats(stats)
     
     def set_cooldown(self, user_id: int, command: str, hours: int = 2):
         data = self.get_user_data(user_id)
@@ -230,21 +118,39 @@ class Database:
         data = self.get_user_data(user_id)
         cooldown_str = data.get('cooldowns', {}).get(command)
         if cooldown_str:
-            cooldown_end = datetime.fromisoformat(cooldown_str)
-            if datetime.now() < cooldown_end:
-                return cooldown_end
+            cd = datetime.fromisoformat(cooldown_str)
+            return cd if datetime.now() < cd else None
         return None
     
-    def clear_cooldowns(self, user_id: int):
+    def check_gold(self, user_id: int) -> bool:
         data = self.get_user_data(user_id)
-        data['cooldowns'] = {}
-        self.save_user_data(user_id, data)
+        if data.get('subscription') != 'gold': return False
+        if data.get('is_permanent'): return True
+        sub_end = data.get('subscription_end')
+        return datetime.now() < datetime.fromisoformat(sub_end) if sub_end else False
+    
+    def get_effective_luck(self, user_id: int) -> float:
+        data = self.get_user_data(user_id)
+        luck = data.get('luck', 1.0)
+        
+        # Временная удача
+        if data.get('temp_luck') and data.get('temp_luck_end'):
+            end = datetime.fromisoformat(data['temp_luck_end'])
+            if datetime.now() < end:
+                luck = max(luck, data.get('temp_luck_value', 1.0))
+        
+        # Бонус эвента
+        event_bonus = data.get('event_bonus')
+        if event_bonus and event_bonus.get('end_time'):
+            end = datetime.fromisoformat(event_bonus['end_time'])
+            if datetime.now() < end:
+                luck = round(luck * event_bonus.get('value', 1.0), 2)
+        
+        return luck
     
     def buy_gold(self, user_id: int) -> bool:
-        """Купить GOLD подписку за 1500 ¢"""
         data = self.get_user_data(user_id)
-        if data['balance'] < 1500:
-            return False
+        if data['balance'] < 1500: return False
         data['balance'] = round(data['balance'] - 1500, 2)
         data['subscription'] = 'gold'
         data['subscription_end'] = (datetime.now() + timedelta(days=30)).isoformat()
@@ -252,7 +158,6 @@ class Database:
         return True
     
     def give_gold(self, user_id: int, days: int = 30, permanent: bool = False):
-        """Выдать GOLD подписку"""
         data = self.get_user_data(user_id)
         data['subscription'] = 'gold'
         if permanent:
@@ -263,188 +168,22 @@ class Database:
             data['subscription_end'] = (datetime.now() + timedelta(days=days)).isoformat()
         self.save_user_data(user_id, data)
     
-    def remove_gold(self, user_id: int):
-        """Удалить GOLD подписку"""
-        data = self.get_user_data(user_id)
-        data['subscription'] = None
-        data['subscription_end'] = None
-        data['is_permanent'] = False
-        self.save_user_data(user_id, data)
-    
-    def check_gold(self, user_id: int) -> bool:
-        """Проверить активна ли GOLD подписка"""
-        data = self.get_user_data(user_id)
-        if data.get('subscription') != 'gold':
-            return False
-        if data.get('is_permanent'):
-            return True
-        sub_end = data.get('subscription_end')
-        if sub_end:
-            return datetime.now() < datetime.fromisoformat(sub_end)
-        return False
-    
     def set_luck(self, user_id: int, luck: float):
-        """Установить постоянную удачу пользователю (1.0 - 100.0)"""
         data = self.get_user_data(user_id)
-        # Ограничиваем удачу от 1.0 до 100.0
-        luck = max(1.0, min(100.0, luck))
-        data['luck'] = round(luck, 2)
+        data['luck'] = max(1.0, min(100.0, luck))
         self.save_user_data(user_id, data)
-    
-    def get_effective_luck(self, user_id: int) -> float:
-        """Получить эффективную удачу (постоянную + временную + бонус эвента)"""
-        data = self.get_user_data(user_id)
-        base_luck = data.get('luck', 1.0)
-        
-        # Проверяем временную удачу
-        if data.get('temp_luck') and data.get('temp_luck_end'):
-            temp_end = datetime.fromisoformat(data['temp_luck_end'])
-            if datetime.now() < temp_end:
-                temp_luck = data.get('temp_luck_value', 1.0)
-                base_luck = max(base_luck, temp_luck)  # Берем максимальную удачу
-        
-        # Проверяем бонус от эвента
-        event_bonus = data.get('event_bonus')
-        if event_bonus and event_bonus.get('end_time'):
-            bonus_end = datetime.fromisoformat(event_bonus['end_time'])
-            if datetime.now() < bonus_end:
-                # Бонус умножается на базовую удачу
-                bonus_value = event_bonus.get('value', 1.0)
-                base_luck = round(base_luck * bonus_value, 2)
-        
-        return base_luck
     
     def set_temp_luck(self, user_id: int, luck: float, minutes: int = 5):
-        """Установить временную удачу на N минут"""
         data = self.get_user_data(user_id)
-        luck = max(1.0, min(100.0, luck))
         data['temp_luck'] = True
-        data['temp_luck_value'] = round(luck, 2)
+        data['temp_luck_value'] = max(1.0, min(100.0, luck))
         data['temp_luck_end'] = (datetime.now() + timedelta(minutes=minutes)).isoformat()
         self.save_user_data(user_id, data)
     
-    def remove_temp_luck(self, user_id: int):
-        """Удалить временную удачу"""
-        data = self.get_user_data(user_id)
-        data['temp_luck'] = None
-        data['temp_luck_value'] = None
-        data['temp_luck_end'] = None
-        self.save_user_data(user_id, data)
-    
-    def get_temp_luck_info(self, user_id: int) -> Optional[Dict[str, Any]]:
-        """Получить информацию о временной удаче"""
-        data = self.get_user_data(user_id)
-        if data.get('temp_luck') and data.get('temp_luck_end'):
-            end_time = datetime.fromisoformat(data['temp_luck_end'])
-            if datetime.now() < end_time:
-                return {
-                    'value': data['temp_luck_value'],
-                    'end_time': end_time
-                }
-        return None
-    
     def set_event_bonus(self, user_id: int, event_id: int, bonus_value: float, end_time: datetime):
-        """Установить бонус от эвента"""
         data = self.get_user_data(user_id)
-        data['event_bonus'] = {
-            'event_id': event_id,
-            'value': bonus_value,
-            'end_time': end_time.isoformat()
-        }
+        data['event_bonus'] = {'event_id': event_id, 'value': bonus_value, 'end_time': end_time.isoformat()}
         self.save_user_data(user_id, data)
-    
-    def remove_event_bonus(self, user_id: int):
-        """Удалить бонус от эвента"""
-        data = self.get_user_data(user_id)
-        data['event_bonus'] = None
-        self.save_user_data(user_id, data)
-    
-    def get_event_bonus_info(self, user_id: int) -> Optional[Dict[str, Any]]:
-        """Получить информацию о бонусе от эвента"""
-        data = self.get_user_data(user_id)
-        event_bonus = data.get('event_bonus')
-        if event_bonus and event_bonus.get('end_time'):
-            end_time = datetime.fromisoformat(event_bonus['end_time'])
-            if datetime.now() < end_time:
-                return {
-                    'event_id': event_bonus['event_id'],
-                    'value': event_bonus['value'],
-                    'end_time': end_time
-                }
-        return None
-    
-    def has_active_event_bonus(self, user_id: int) -> bool:
-        """Проверить есть ли активный бонус от эвента"""
-        return self.get_event_bonus_info(user_id) is not None
-    
-    def set_luck_all(self, luck: float):
-        """Установить удачу ВСЕМ пользователям"""
-        users = self.get_all_users()
-        for user_id, data in users.items():
-            data['luck'] = max(1.0, min(100.0, luck))
-            self.save_user_data(user_id, data)
-        return len(users)
-    
-    def remove_luck_all(self):
-        """Сбросить удачу у ВСЕХ пользователей до 1.0"""
-        users = self.get_all_users()
-        for user_id, data in users.items():
-            data['luck'] = 1.0
-            data['temp_luck'] = None
-            data['temp_luck_value'] = None
-            data['temp_luck_end'] = None
-            data['event_bonus'] = None
-            self.save_user_data(user_id, data)
-        return len(users)
-    
-    def get_user_luck_info(self, user_id: int) -> Dict[str, Any]:
-        """Получить полную информацию об удаче пользователя"""
-        data = self.get_user_data(user_id)
-        temp_info = self.get_temp_luck_info(user_id)
-        event_bonus_info = self.get_event_bonus_info(user_id)
-        
-        info = {
-            'base_luck': data.get('luck', 1.0),
-            'has_temp_luck': False,
-            'temp_luck_value': None,
-            'temp_luck_end': None,
-            'has_event_bonus': False,
-            'event_bonus_value': None,
-            'event_bonus_end': None,
-            'effective_luck': self.get_effective_luck(user_id)
-        }
-        
-        if temp_info:
-            info.update({
-                'has_temp_luck': True,
-                'temp_luck_value': temp_info['value'],
-                'temp_luck_end': temp_info['end_time']
-            })
-        
-        if event_bonus_info:
-            info.update({
-                'has_event_bonus': True,
-                'event_bonus_value': event_bonus_info['value'],
-                'event_bonus_end': event_bonus_info['end_time']
-            })
-        
-        return info
-    
-    def set_channel_check(self, user_id: int, passed: bool = True):
-        data = self.get_user_data(user_id)
-        data['channel_check'] = passed
-        self.save_user_data(user_id, data)
-    
-    def get_channel_check(self, user_id: int) -> bool:
-        return self.get_user_data(user_id).get('channel_check', False)
-    
-    def ban_user(self, user_id: int, ban: bool = True):
-        data = self.get_user_data(user_id)
-        data['is_banned'] = ban
-        self.save_user_data(user_id, data)
-    
-    def is_banned(self, user_id: int) -> bool:
-        return self.get_user_data(user_id).get('is_banned', False)
     
     def get_all_users(self):
         if self.redis:
@@ -454,20 +193,18 @@ class Database:
                 users[user_id] = json.loads(self.redis.get(key))
             return users
         else:
-            return self.memory_db.copy()
+            return {k: v for k, v in self.memory_db.items() if isinstance(k, int)}
 
 # =================== ИНИЦИАЛИЗАЦИЯ ===================
 db = Database()
 bot = Bot(token=BOT_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
+dp = Dispatcher()
 active_event = None
 event_participants = {}
 
 # =================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===================
 async def is_chat_admin(user_id: int, chat_id: int) -> bool:
-    if chat_id > 0:  # Личные сообщения
-        return False
+    if chat_id > 0: return False
     try:
         member = await bot.get_chat_member(chat_id, user_id)
         return member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]
@@ -482,335 +219,105 @@ async def check_channel_subscription(user_id: int) -> bool:
         return False
 
 def format_time(end_time: Optional[datetime]) -> str:
-    if not end_time:
-        return "∞ (вечная)"
-    if datetime.now() >= end_time:
-        return "истекла"
+    if not end_time: return "∞"
+    if datetime.now() >= end_time: return "истекла"
     delta = end_time - datetime.now()
-    
-    if delta.days > 0:
-        return f"{delta.days}д {delta.seconds//3600}ч"
-    elif delta.seconds >= 3600:
-        hours = delta.seconds // 3600
-        minutes = (delta.seconds % 3600) // 60
-        return f"{hours}ч {minutes}м"
-    else:
-        minutes = delta.seconds // 60
-        seconds = delta.seconds % 60
-        return f"{minutes}м {seconds}с"
-
-def format_minutes(minutes: int) -> str:
-    if minutes >= 60:
-        hours = minutes // 60
-        mins = minutes % 60
-        return f"{hours}ч {mins}м"
-    return f"{minutes}м"
-
-def get_sub_status(user_data: dict) -> str:
-    if user_data.get('subscription') != 'gold':
-        return "⭕ Нет подписки"
-    if user_data.get('is_permanent'):
-        return "✨ GOLD ∞ (вечная)"
-    sub_end = user_data.get('subscription_end')
-    if sub_end:
-        end = datetime.fromisoformat(sub_end)
-        if datetime.now() < end:
-            days = (end - datetime.now()).days
-            return f"✨ GOLD ({days} дней)"
-    return "⭕ Подписка истекла"
-
-def format_number(num: float) -> str:
-    """Форматирование чисел с разделителями"""
-    return f"{num:,.2f}".replace(",", " ").replace(".", ",")
-
-# =================== ОБРАБОТКА ВСЕХ СООБЩЕНИЙ ===================
-@dp.message()
-async def track_all_messages(message: Message):
-    """Отслеживание всех сообщений для статистики"""
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-    
-    # Увеличиваем счетчик сообщений
-    db.increment_stat('total_messages')
-    
-    # Если это не ЛС, обновляем статистику чата
-    if message.chat.type != ChatType.PRIVATE:
-        chat_title = message.chat.title
-        chat_type = message.chat.type
-        
-        # Обновляем данные чата
-        db.update_chat_stats(chat_id, chat_title, chat_type)
-        
-        # Обновляем счетчики типов чатов
-        stats = db.get_bot_stats()
-        if chat_type == 'group':
-            stats['groups_count'] = stats.get('groups_count', 0) + 1
-        elif chat_type == 'supergroup':
-            stats['supergroups_count'] = stats.get('supergroups_count', 0) + 1
-        elif chat_type == 'channel':
-            stats['channels_count'] = stats.get('channels_count', 0) + 1
-        
-        # Общее количество чатов
-        all_chats = db.get_all_chats()
-        stats['chats_count'] = len(all_chats)
-        
-        db.update_bot_stats(stats)
-    
-    # Обновляем статистику пользователей
-    stats = db.get_bot_stats()
-    all_users = db.get_all_users()
-    stats['total_users'] = len(all_users)
-    
-    # Считаем активных пользователей (были активны в последние 7 дней)
-    active_count = 0
-    for user_data in all_users.values():
-        # Проверяем активность (упрощенная версия)
-        if user_data.get('balance', 0) > 0:
-            active_count += 1
-    stats['active_users'] = active_count
-    
-    db.update_bot_stats(stats)
-
-# =================== ПРОВЕРКА ПОДПИСКИ НА КАНАЛ ===================
-@dp.message(Command("check"))
-async def check_channel(message: Message):
-    text = (
-        "🔒 *Для работы бота нужна подписка на канал разработчика*\n\n"
-        "📢 Подпишись на канал и нажми '✅ ПРОВЕРИТЬ'"
-    )
-    
-    keyboard = InlineKeyboardBuilder()
-    keyboard.row(InlineKeyboardButton(text="📢 ПОДПИСАТЬСЯ НА КАНАЛ", url=f"https://t.me/{CHANNEL_USERNAME}"))
-    keyboard.row(InlineKeyboardButton(text="✅ ПРОВЕРИТЬ ПОДПИСКУ", callback_data="verify_sub"))
-    
-    await message.answer(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
-
-@dp.callback_query(lambda c: c.data == "verify_sub")
-async def verify_sub_callback(callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    
-    if await check_channel_subscription(user_id):
-        db.set_channel_check(user_id, True)
-        
-        # После проверки показываем приветствие с кнопкой добавления в группу
-        text = (
-            "✅ *Подписка подтверждена!*\n\n"
-            "🤖 *Привет! Я Фермер Бот!*\n\n"
-            "💎 *Добавь меня в группу и становись богачом!*\n\n"
-            "💰 *Что я умею:*\n"
-            "• 5 фарм-команд\n"
-            "• Магазин улучшений\n"
-            "• Эвенты с наградами\n"
-            "• Система удачи\n"
-            "• GOLD подписка\n\n"
-            "🚀 *Нажми кнопку ниже чтобы добавить бота в группу:*"
-        )
-        
-        keyboard = InlineKeyboardBuilder()
-        keyboard.row(InlineKeyboardButton(text="➕ ДОБАВИТЬ БОТА В ГРУППУ", url="https://t.me/farmirobot?startgroup=true"))
-        keyboard.row(
-            InlineKeyboardButton(text="🚀 НАЧАТЬ", callback_data="start_menu"),
-            InlineKeyboardButton(text="❓ ПОМОЩЬ", callback_data="help_menu")
-        )
-        
-        await callback_query.message.edit_text(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
-    else:
-        text = (
-            "❌ *Вы не подписаны!*\n\n"
-            "📢 *Подпишитесь на канал:* @artem_bori\n"
-            "*и нажмите '🔄 ПРОВЕРИТЬ' снова*"
-        )
-        
-        keyboard = InlineKeyboardBuilder()
-        keyboard.row(InlineKeyboardButton(text="📢 ПОДПИСАТЬСЯ НА КАНАЛ", url=f"https://t.me/{CHANNEL_USERNAME}"))
-        keyboard.row(InlineKeyboardButton(text="🔄 ПРОВЕРИТЬ", callback_data="verify_sub"))
-        
-        await callback_query.message.edit_text(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
-    
-    await callback_query.answer()
+    if delta.days > 0: return f"{delta.days}д {delta.seconds//3600}ч"
+    if delta.seconds >= 3600: return f"{delta.seconds//3600}ч {delta.seconds%3600//60}м"
+    return f"{delta.seconds//60}м"
 
 # =================== ОСНОВНЫЕ КОМАНДЫ ===================
 @dp.message(Command("start"))
 async def start_cmd(message: Message):
     user_id = message.from_user.id
-    
-    if db.is_banned(user_id):
+    if db.get_user_data(user_id).get('is_banned'):
         await message.answer("⛔ Вы забанены!")
         return
     
-    # Проверяем, что это не личные сообщения
     if message.chat.type == ChatType.PRIVATE:
-        # В личных сообщениях показываем приветствие с кнопкой добавления в группу
-        text = (
-            "🤖 *Привет! Я Фермер Бот!*\n\n"
-            "📢 *Для начала работы:*\n"
-            "1️⃣ Подпишись на канал разработчика\n"
-            "2️⃣ Добавь меня в группу\n"
-            "3️⃣ Становись богачом! 💰\n\n"
-            "🚀 *Бот работает только в группах и чатах!*"
-        )
-        
+        text = "🤖 *Farm Bot*\n\n📢 Подпишись на канал и добавь бота в группу!"
         keyboard = InlineKeyboardBuilder()
-        keyboard.row(InlineKeyboardButton(text="📢 ПОДПИСАТЬСЯ НА КАНАЛ", url=f"https://t.me/{CHANNEL_USERNAME}"))
-        keyboard.row(InlineKeyboardButton(text="➕ ДОБАВИТЬ БОТА В ГРУППУ", url="https://t.me/farmirobot?startgroup=true"))
-        
+        keyboard.row(InlineKeyboardButton(text="📢 Канал", url=f"https://t.me/{CHANNEL_USERNAME}"))
+        keyboard.row(InlineKeyboardButton(text="➕ В группу", url="https://t.me/farmirobot?startgroup=true"))
         await message.answer(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
         return
     
-    # В группах проверяем подписку
-    if user_id != OWNER_ID and not db.get_channel_check(user_id):
-        await check_channel(message)
+    if user_id != OWNER_ID and not db.get_user_data(user_id).get('channel_check'):
+        keyboard = InlineKeyboardBuilder()
+        keyboard.row(InlineKeyboardButton(text="📢 Канал", url=f"https://t.me/{CHANNEL_USERNAME}"))
+        keyboard.row(InlineKeyboardButton(text="✅ Проверить", callback_data="verify_sub"))
+        await message.answer("🔒 Подпишись на канал!", reply_markup=keyboard.as_markup())
         return
     
     user_data = db.get_user_data(user_id)
-    luck_info = db.get_user_luck_info(user_id)
-    
-    # Главное меню с кнопками
     text = (
         f"🎮 *Farm Bot*\n\n"
-        f"💰 *Баланс:* {user_data['balance']:.2f} ¢\n"
-        f"✨ *Сила:* {user_data['star_power']}\n"
-        f"⏳ *Урожайность:* {user_data['productivity']:.2f}\n"
-        f"🍀 *Удача:* {luck_info['effective_luck']:.1f}x\n\n"
-        "🌵 *Фарм команды:*\n"
-        "кактус ферма шахта сад охота\n"
-        "(кулдаун 2 часа)"
+        f"💰 Баланс: {user_data['balance']:.2f} ¢\n"
+        f"✨ Сила: {user_data['star_power']}\n"
+        f"🍀 Удача: {db.get_effective_luck(user_id):.1f}x\n\n"
+        f"🌵 *Фарм команды:*\nкактус ферма шахта сад охота\n(кулдаун 2 часа)"
     )
-    
-    # Добавляем информацию о бонусе эвента
-    if luck_info.get('has_event_bonus'):
-        time_left = format_time(luck_info['event_bonus_end'])
-        text += f"\n\n✨ *Активен бонус от эвента: +{(luck_info['event_bonus_value'] - 1) * 100:.0f}% к удаче!*\n⏳ *Осталось:* {time_left}"
     
     keyboard = InlineKeyboardBuilder()
     keyboard.row(
         InlineKeyboardButton(text="📊 Профиль", callback_data="profile"),
         InlineKeyboardButton(text="🛒 Магазин", callback_data="shop")
     )
-    keyboard.row(
-        InlineKeyboardButton(text="🎪 Эвенты", callback_data="events"),
-        InlineKeyboardButton(text="❓ Помощь", callback_data="help_menu")
-    )
-    
-    # Кнопка только для владельца
     if user_id == OWNER_ID:
-        keyboard.row(InlineKeyboardButton(text="👑 Панель владельца", callback_data="owner_panel"))
+        keyboard.row(InlineKeyboardButton(text="👑 Владелец", callback_data="owner_panel"))
     
     await message.answer(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
 
 @dp.message(Command("profile"))
 async def profile_cmd(message: Message):
     user_id = message.from_user.id
-    
-    # Проверяем, что это не личные сообщения
     if message.chat.type == ChatType.PRIVATE:
-        await message.answer("🤖 Профиль доступен только в группах и чатах!")
-        return
-    
-    if user_id != OWNER_ID and not db.get_channel_check(user_id):
-        await message.answer("❌ Сначала подпишитесь на канал! /check")
+        await message.answer("📊 Профиль только в группах!")
         return
     
     user_data = db.get_user_data(user_id)
-    luck_info = db.get_user_luck_info(user_id)
-    sub_status = get_sub_status(user_data)
-    
-    # Формируем информацию об удаче
-    luck_text = f"🍀 *Удача:* {luck_info['effective_luck']:.1f}x"
-    
-    if luck_info['has_temp_luck']:
-        time_left = format_time(luck_info['temp_luck_end'])
-        luck_text += f" (временная {luck_info['temp_luck_value']:.1f}x, осталось: {time_left})"
-    
-    if luck_info.get('has_event_bonus'):
-        bonus_percent = (luck_info['event_bonus_value'] - 1) * 100
-        time_left = format_time(luck_info['event_bonus_end'])
-        luck_text += f"\n✨ *Бонус от эвента:* +{bonus_percent:.0f}% к удаче\n⏳ *Осталось:* {time_left}"
+    luck = db.get_effective_luck(user_id)
     
     text = (
         f"📊 *Профиль*\n\n"
-        f"💰 *Баланс:* {user_data['balance']:.2f} ¢\n"
-        f"✨ *Сила:* {user_data['star_power']}\n"
-        f"⏳ *Урожайность:* {user_data['productivity']:.2f}\n"
-        f"{luck_text}\n"
-        f"🎖️ *Подписка:* {sub_status}\n"
-        f"📢 *Канал:* {'✅' if db.get_channel_check(user_id) else '❌'}\n\n"
-        "⏰ *Кулдауны:*\n"
+        f"💰 Баланс: {user_data['balance']:.2f} ¢\n"
+        f"✨ Сила: {user_data['star_power']}\n"
+        f"⏳ Урожайность: {user_data['productivity']:.2f}\n"
+        f"🍀 Удача: {luck:.1f}x\n\n"
+        f"⏰ *Кулдауны:*\n"
     )
     
     for cmd in FARM_COMMANDS:
         cd = db.get_cooldown(user_id, cmd)
-        if cd:
-            text += f"• {cmd}: {format_time(cd)}\n"
-        else:
-            text += f"• {cmd}: ✅ готово\n"
+        text += f"• {cmd}: {format_time(cd) if cd else '✅ готово'}\n"
     
     keyboard = InlineKeyboardBuilder()
     keyboard.row(
         InlineKeyboardButton(text="🌵 Кактус", callback_data="farm_cactus"),
-        InlineKeyboardButton(text="🚜 Ферма", callback_data="farm_farm"),
-        InlineKeyboardButton(text="⛏️ Шахта", callback_data="farm_mine")
-    )
-    keyboard.row(
-        InlineKeyboardButton(text="🌻 Сад", callback_data="farm_garden"),
-        InlineKeyboardButton(text="🏹 Охота", callback_data="farm_hunt")
+        InlineKeyboardButton(text="🚜 Ферма", callback_data="farm_farm")
     )
     keyboard.row(
         InlineKeyboardButton(text="🛒 Магазин", callback_data="shop"),
-        InlineKeyboardButton(text="🎪 Эвенты", callback_data="events")
+        InlineKeyboardButton(text="🔙 Назад", callback_data="start_menu")
     )
-    keyboard.row(InlineKeyboardButton(text="🔙 Назад", callback_data="start_menu"))
-    
-    is_admin = await is_chat_admin(user_id, message.chat.id)
-    if is_admin and db.check_gold(user_id):
-        keyboard.row(InlineKeyboardButton(text="🚀 Запустить эвент", callback_data="event_start"))
-    
-    # Кнопка панели только для владельца
-    if user_id == OWNER_ID:
-        keyboard.row(InlineKeyboardButton(text="👑 Панель владельца", callback_data="owner_panel"))
     
     await message.answer(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
 
 @dp.message(Command("shop"))
 async def shop_cmd(message: Message):
     user_id = message.from_user.id
-    
-    # Проверяем, что это не личные сообщения
-    if message.chat.type == ChatType.PRIVATE:
-        await message.answer("🤖 Магазин доступен только в группах и чатах!")
-        return
-    
-    if user_id != OWNER_ID and not db.get_channel_check(user_id):
-        await message.answer("❌ Сначала подпишитесь! /check")
-        return
-    
     user_data = db.get_user_data(user_id)
     has_gold = db.check_gold(user_id)
-    luck_info = db.get_user_luck_info(user_id)
     
     text = (
         "🛒 *Магазин*\n\n"
-        "✨ *Сила звёздности (100 ¢)*\n"
-        "+0.5 ¢ к каждой награде\n\n"
-        "⏳ *Урожайность (150 ¢)*\n"
-        "×1.1 к наградам\n\n"
-        "🍀 *Удача (200 ¢)*\n"
-        "+0.1x к удаче\n\n"
-        "🎖️ *GOLD подписка (1500 ¢)*\n"
-        "+20% к наградам на 30 дней\n"
+        "✨ *Сила звёздности (100 ¢)*\n+0.5 ¢ к награде\n\n"
+        "⏳ *Урожайность (150 ¢)*\n×1.1 к наградам\n\n"
+        "🍀 *Удача (200 ¢)*\n+0.1x к удаче\n\n"
+        "🎖️ *GOLD подписка (1500 ¢)*\n+20% к наградам на 30 дней\n\n"
+        f"💰 Ваш баланс: {user_data['balance']:.2f} ¢\n"
+        f"🍀 Удача: {db.get_effective_luck(user_id):.1f}x"
     )
-    
-    if has_gold:
-        text += f"• У вас: {get_sub_status(user_data)}\n"
-    
-    text += f"\n💰 *Ваш баланс:* {user_data['balance']:.2f} ¢"
-    text += f"\n🍀 *Текущая удача:* {luck_info['effective_luck']:.1f}x"
-    
-    # Добавляем информацию о бонусе эвента
-    if luck_info.get('has_event_bonus'):
-        bonus_percent = (luck_info['event_bonus_value'] - 1) * 100
-        time_left = format_time(luck_info['event_bonus_end'])
-        text += f"\n\n✨ *У вас активен бонус от эвента: +{bonus_percent:.0f}% к удаче!*\n⏳ *Осталось:* {time_left}"
     
     keyboard = InlineKeyboardBuilder()
     keyboard.row(
@@ -819,23 +326,15 @@ async def shop_cmd(message: Message):
     )
     keyboard.row(
         InlineKeyboardButton(text="🍀 Удача +0.1", callback_data="buy_luck"),
-        InlineKeyboardButton(text="🎖️ " + ("Продлить GOLD" if has_gold else "Купить GOLD"), callback_data="buy_gold")
+        InlineKeyboardButton(text="🎖️ GOLD", callback_data="buy_gold")
     )
-    
     keyboard.row(InlineKeyboardButton(text="🔙 Назад", callback_data="profile"))
     
     await message.answer(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
 
 @dp.message(Command("events"))
 async def events_cmd(message: Message):
-    user_id = message.from_user.id
-    
-    if user_id != OWNER_ID and not db.get_channel_check(user_id):
-        await message.answer("❌ Сначала подпишитесь! /check")
-        return
-    
     global active_event
-    
     text = "🎪 *Эвенты*\n\n"
     
     if active_event:
@@ -843,273 +342,277 @@ async def events_cmd(message: Message):
         time_left = format_time(active_event['end_time'])
         text += (
             f"🚀 *Активный эвент!*\n"
-            f"🎯 *{active_event['type']}*\n"
-            f"💰 *{active_event['reward']} ¢*\n"
+            f"🎯 {active_event['type']}\n"
+            f"💰 {active_event['reward']} ¢\n"
+            f"👥 {parts} участников\n"
+            f"⏳ {time_left}"
         )
-        
-        # Добавляем описание особенностей для мега эвента
-        if "Мега" in active_event['type']:
-            bonus_value = active_event.get('bonus_value', 1.2)
-            bonus_percent = (bonus_value - 1) * 100
-            text += f"✨ *Особенность:* Участники получают +{bonus_percent:.0f}% к удаче до конца эвента!\n"
-        
-        text += f"👥 *{parts} участников*\n"
-        text += f"⏳ *{time_left}*\n\n"
-        text += f"🆔 *ID:* {active_event['id']}"
-    else:
-        text += (
-            "📭 *Нет активных эвентов*\n\n"
-            "✨ *Как запустить:*\n"
-            "1. GOLD подписка\n"
-            "2. Быть админом чата\n"
-            "3. Нажать 'Запустить эвент'\n\n"
-            "💰 *Награды:*\n"
-            "• 🎯 Обычный: 100-300 ¢\n"
-            "• 🚀 Средний: 300-600 ¢\n"
-            "• 💎 Мега: 600-1000 ¢ + бонус удачи!"
-        )
-    
-    keyboard = InlineKeyboardBuilder()
-    
-    if active_event:
+        keyboard = InlineKeyboardBuilder()
         keyboard.row(InlineKeyboardButton(text="🎪 Присоединиться", callback_data=f"join_event_{active_event['id']}"))
     else:
-        is_admin = await is_chat_admin(user_id, message.chat.id)
-        if is_admin and db.check_gold(user_id):
-            keyboard.row(InlineKeyboardButton(text="🚀 Запустить эвент", callback_data="event_start"))
+        text += "📭 Нет активных эвентов\n\n🚀 Запускают админы с GOLD"
+        keyboard = InlineKeyboardBuilder()
+        if await is_chat_admin(message.from_user.id, message.chat.id) and db.check_gold(message.from_user.id):
+            keyboard.row(InlineKeyboardButton(text="🚀 Запустить", callback_data="event_start"))
     
-    keyboard.row(InlineKeyboardButton(text="📊 Профиль", callback_data="profile"))
     keyboard.row(InlineKeyboardButton(text="🔙 Назад", callback_data="start_menu"))
-    
     await message.answer(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
 
-@dp.message(Command("help"))
-async def help_cmd(message: Message):
-    text = (
-        "❓ *Помощь*\n\n"
-        "🌵 *Фарм команды:*\n"
-        "кактус, ферма, шахта, сад, охота\n"
-        "(кулдаун 2 часа)\n\n"
-        "📋 *Основные команды:*\n"
-        "/start - начало\n"
-        "/profile - профиль\n"
-        "/shop - магазин\n"
-        "/events - эвенты\n"
-        "/check - подписка на канал\n\n"
-        "🎪 *Эвенты:*\n"
-        "Запускают админы с GOLD\n"
-        "Участвовать может любой\n"
-        "💎 *Мега эвент даёт +20% к удаче до конца эвента!*\n\n"
-        "🎖️ *GOLD подписка:*\n"
-        "+20% к наградам\n"
-        "1500 ¢ / 30 дней\n\n"
-        "🍀 *Удача:*\n"
-        "Влияет на размер наград\n"
-        "Можно купить в магазине\n"
-        "Можно получить от эвентов"
-    )
+# =================== ФАРМ КОМАНДЫ ===================
+@dp.message(lambda msg: msg.text and msg.text.lower() in FARM_COMMANDS)
+async def farm_command(message: Message):
+    user_id = message.from_user.id
+    cmd = message.text.lower()
     
-    keyboard = InlineKeyboardBuilder()
-    keyboard.row(
-        InlineKeyboardButton(text="🚀 Начать", callback_data="start_menu"),
-        InlineKeyboardButton(text="📊 Профиль", callback_data="profile")
-    )
-    
-    await message.answer(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
-
-# =================== СТАТИСТИКА БОТА ===================
-@dp.message(Command("stats"))
-async def stats_cmd(message: Message):
-    """Статистика бота - доступна только владельцу"""
-    if message.from_user.id != OWNER_ID:
-        await message.answer("⛔ Нет доступа!")
+    if message.chat.type == ChatType.PRIVATE:
+        await message.answer("⛔ Фарм только в группах!")
         return
     
-    stats = db.get_bot_stats()
-    all_chats = db.get_all_chats()
-    all_users = db.get_all_users()
+    if db.get_user_data(user_id).get('is_banned'):
+        await message.answer("⛔ Вы забанены!")
+        return
     
-    # Считаем активные чаты (активны в последние 7 дней)
-    active_chats = 0
-    week_ago = datetime.now() - timedelta(days=7)
+    cd = db.get_cooldown(user_id, cmd)
+    if cd:
+        await message.reply(f"⏳ {cmd} на кулдауне!\nВернитесь через {format_time(cd)}")
+        return
     
-    for chat_data in all_chats.values():
-        last_activity = datetime.fromisoformat(chat_data.get('last_activity', datetime.now().isoformat()))
-        if last_activity > week_ago:
-            active_chats += 1
+    user_data = db.get_user_data(user_id)
+    cmd_info = FARM_COMMANDS[cmd]
     
-    # Считаем общий баланс всех пользователей
-    total_balance = sum(user.get('balance', 0) for user in all_users.values())
-    total_earned = sum(user.get('total_earned', 0) for user in all_users.values())
+    # Расчет награды
+    luck = db.get_effective_luck(user_id)
+    base_reward = random.randint(cmd_info["min"], cmd_info["max"])
     
-    # Считаем пользователей с подписками
-    gold_users = sum(1 for user in all_users.values() if user.get('subscription') == 'gold')
+    # Учет удачи (30% шанс)
+    if random.random() < 0.3:
+        base_reward = int(base_reward * (1 + (luck - 1.0) * 0.1))
     
-    # Форматируем время работы бота
-    start_time = datetime.fromisoformat(stats.get('start_time', datetime.now().isoformat()))
-    uptime = datetime.now() - start_time
+    # Бонусы
+    reward = base_reward + user_data['star_power'] * 0.5
+    reward *= user_data['productivity']
+    if db.check_gold(user_id): reward *= 1.2
     
-    if uptime.days > 0:
-        uptime_str = f"{uptime.days} дней, {uptime.seconds//3600} часов"
+    # Рандомный бонус (26% шанс)
+    if random.random() < 0.26:
+        reward += random.randint(5, 15)
+    
+    reward = round(reward, 2)
+    db.update_balance(user_id, reward)
+    db.set_cooldown(user_id, cmd, 2)
+    
+    response = (
+        f"{cmd_info['emoji']} {cmd.upper()} ✅ *ЗАЧЁТ!*\n\n"
+        f"💰 *+{reward:.2f} ¢*\n"
+        f"💳 Баланс: {db.get_user_data(user_id)['balance']:.2f} ¢\n\n"
+        f"⏳ Возвращайтесь через 2 часа"
+    )
+    
+    await message.reply(response, parse_mode="Markdown")
+
+# =================== CALLBACK ОБРАБОТЧИКИ ===================
+@dp.callback_query(lambda c: c.data == "verify_sub")
+async def verify_sub_callback(callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    if await check_channel_subscription(user_id):
+        user_data = db.get_user_data(user_id)
+        user_data['channel_check'] = True
+        db.save_user_data(user_id, user_data)
+        await callback_query.message.edit_text("✅ Подписка подтверждена!")
     else:
-        uptime_str = f"{uptime.seconds//3600} часов, {(uptime.seconds%3600)//60} минут"
-    
-    # Создаем красивую рамку для статистики
-    stats_lines = [
-        f"👥 *Пользователи:*",
-        f"• Всего: {stats.get('total_users', 0)}",
-        f"• Активных: {stats.get('active_users', 0)}",
-        f"• С GOLD: {gold_users}",
-        f"",
-        f"💬 *Чаты:*",
-        f"• Всего: {stats.get('chats_count', 0)}",
-        f"• Активных: {active_chats}",
-        f"• Группы: {stats.get('groups_count', 0)}",
-        f"• Супергруппы: {stats.get('supergroups_count', 0)}",
-        f"• Каналы: {stats.get('channels_count', 0)}",
-        f"",
-        f"💰 *Экономика:*",
-        f"• Общий баланс: {format_number(total_balance)} ¢",
-        f"• Всего заработано: {format_number(total_earned)} ¢",
-        f"• Средний баланс: {format_number(total_balance / max(1, stats.get('total_users', 1)))} ¢",
-        f"",
-        f"📈 *Активность:*",
-        f"• Сообщений: {stats.get('total_messages', 0)}",
-        f"• Фарм-команд: {stats.get('total_farm_commands', 0)}",
-        f"• Время работы: {uptime_str}"
-    ]
-    
-    # Находим максимальную длину строки
-    max_length = max(len(line) for line in stats_lines) if stats_lines else 0
-    width = max(max_length, 40)
-    
-    # Создаем рамку
-    top_border = "╔" + "═" * (width + 2) + "╗\n"
-    title_line = f"║ 📊 {'СТАТИСТИКА БОТА'.center(width)} 📊 ║\n"
-    separator = "╠" + "═" * (width + 2) + "╣\n"
-    content = ""
-    for line in stats_lines:
-        content += f"║ {line.ljust(width)} ║\n"
-    bottom_border = "╚" + "═" * (width + 2) + "╝"
-    
-    text = top_border + title_line + separator + content + bottom_border
-    
-    # Добавляем информацию о последних чатах
-    text += "\n\n🔄 *Последние 5 активных чатов:*\n"
-    
-    # Сортируем чаты по последней активности
-    sorted_chats = sorted(all_chats.items(), 
-                         key=lambda x: datetime.fromisoformat(x[1].get('last_activity', '2000-01-01')), 
-                         reverse=True)
-    
-    for i, (chat_id, chat_data) in enumerate(sorted_chats[:5]):
-        chat_title = chat_data.get('title', f"Чат {chat_id}")
-        chat_type = chat_data.get('type', 'unknown')
-        last_active = datetime.fromisoformat(chat_data.get('last_activity', datetime.now().isoformat()))
-        time_ago = datetime.now() - last_active
-        
-        if time_ago.days > 0:
-            ago_str = f"{time_ago.days}д назад"
-        elif time_ago.seconds >= 3600:
-            ago_str = f"{time_ago.seconds//3600}ч назад"
-        else:
-            ago_str = f"{time_ago.seconds//60}м назад"
-        
-        type_emoji = {
-            'group': '👥',
-            'supergroup': '👥',
-            'channel': '📢',
-            'private': '👤'
-        }.get(chat_type, '❓')
-        
-        text += f"{i+1}. {type_emoji} {chat_title[:20]} - {ago_str}\n"
-    
-    if len(sorted_chats) > 5:
-        text += f"\n...и еще {len(sorted_chats) - 5} чатов"
-    
-    keyboard = InlineKeyboardBuilder()
-    keyboard.row(
-        InlineKeyboardButton(text="📋 Список всех чатов", callback_data="all_chats_list"),
-        InlineKeyboardButton(text="🔄 Обновить статистику", callback_data="refresh_stats")
-    )
-    keyboard.row(InlineKeyboardButton(text="👑 Панель владельца", callback_data="owner_panel"))
-    
-    await message.answer(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
-
-@dp.callback_query(lambda c: c.data == "refresh_stats")
-async def refresh_stats_callback(callback_query: CallbackQuery):
-    """Обновить статистику"""
-    if callback_query.from_user.id != OWNER_ID:
-        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
-        return
-    
-    # Используем существующее сообщение для обновления
-    message = Message(
-        message_id=callback_query.message.message_id,
-        date=datetime.now(),
-        chat=callback_query.message.chat,
-        from_user=callback_query.from_user,
-        text=""
-    )
-    await stats_cmd(message)
-    await callback_query.answer("✅ Статистика обновлена!")
-
-@dp.callback_query(lambda c: c.data == "all_chats_list")
-async def all_chats_list_callback(callback_query: CallbackQuery):
-    """Показать список всех чатов"""
-    if callback_query.from_user.id != OWNER_ID:
-        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
-        return
-    
-    all_chats = db.get_all_chats()
-    
-    if not all_chats:
-        await callback_query.message.edit_text("📭 Бот еще не добавлен ни в один чат.")
-        await callback_query.answer()
-        return
-    
-    # Сортируем чаты по последней активности
-    sorted_chats = sorted(all_chats.items(), 
-                         key=lambda x: datetime.fromisoformat(x[1].get('last_activity', '2000-01-01')), 
-                         reverse=True)
-    
-    text = "📋 *СПИСОК ВСЕХ ЧАТОВ*\n\n"
-    
-    for i, (chat_id, chat_data) in enumerate(sorted_chats[:20]):  # Показываем первые 20
-        chat_title = chat_data.get('title', f"Чат {chat_id}")
-        chat_type = chat_data.get('type', 'unknown')
-        last_active = datetime.fromisoformat(chat_data.get('last_activity', datetime.now().isoformat()))
-        message_count = chat_data.get('message_count', 0)
-        
-        time_ago = datetime.now() - last_active
-        if time_ago.days > 0:
-            ago_str = f"{time_ago.days}д"
-        elif time_ago.seconds >= 3600:
-            ago_str = f"{time_ago.seconds//3600}ч"
-        else:
-            ago_str = f"{time_ago.seconds//60}м"
-        
-        type_emoji = {
-            'group': '👥',
-            'supergroup': '👥',
-            'channel': '📢',
-            'private': '👤'
-        }.get(chat_type, '❓')
-        
-        text += f"*{i+1}. {type_emoji} {chat_title[:30]}*\n"
-        text += f"   🆔: `{chat_id}` | 📝: {message_count} | 🕐: {ago_str} назад\n\n"
-    
-    if len(sorted_chats) > 20:
-        text += f"\n...и еще {len(sorted_chats) - 20} чатов"
-    
-    keyboard = InlineKeyboardBuilder()
-    keyboard.row(
-        InlineKeyboardButton(text="📊 Общая статистика", callback_data="refresh_stats"),
-        InlineKeyboardButton(text="👑 Панель владельца", callback_data="owner_panel")
-    )
-    
-    await callback_query.message.edit_text(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
+        await callback_query.answer("❌ Вы не подписаны!", show_alert=True)
     await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("farm_"))
+async def farm_button_callback(callback_query: CallbackQuery):
+    cmd_map = {"cactus": "кактус", "farm": "ферма", "mine": "шахта", "garden": "сад", "hunt": "охота"}
+    cmd = callback_query.data.replace("farm_", "")
+    if cmd not in cmd_map: return
+    
+    user_id = callback_query.from_user.id
+    cmd_name = cmd_map[cmd]
+    
+    if callback_query.message.chat.type == ChatType.PRIVATE:
+        await callback_query.answer("⛔ Фарм только в группах!", show_alert=True)
+        return
+    
+    cd = db.get_cooldown(user_id, cmd_name)
+    if cd:
+        await callback_query.answer(f"⏳ {cmd_name} на кулдауне!", show_alert=True)
+        return
+    
+    user_data = db.get_user_data(user_id)
+    cmd_info = FARM_COMMANDS[cmd_name]
+    
+    # Расчет награды (аналогично текстовой команде)
+    luck = db.get_effective_luck(user_id)
+    base_reward = random.randint(cmd_info["min"], cmd_info["max"])
+    
+    if random.random() < 0.3:
+        base_reward = int(base_reward * (1 + (luck - 1.0) * 0.1))
+    
+    reward = base_reward + user_data['star_power'] * 0.5
+    reward *= user_data['productivity']
+    if db.check_gold(user_id): reward *= 1.2
+    
+    if random.random() < 0.26:
+        reward += random.randint(5, 15)
+    
+    reward = round(reward, 2)
+    db.update_balance(user_id, reward)
+    db.set_cooldown(user_id, cmd_name, 2)
+    
+    response = (
+        f"{cmd_info['emoji']} {cmd_name.upper()} ✅ *ЗАЧЁТ!*\n\n"
+        f"💰 *+{reward:.2f} ¢*\n"
+        f"💳 Баланс: {db.get_user_data(user_id)['balance']:.2f} ¢"
+    )
+    
+    await callback_query.message.answer(response, parse_mode="Markdown")
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data in ["buy_star", "buy_prod", "buy_luck", "buy_gold"])
+async def buy_callback(callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    action = callback_query.data
+    user_data = db.get_user_data(user_id)
+    
+    if action == "buy_star":
+        if user_data['balance'] >= 100:
+            db.update_balance(user_id, -100)
+            user_data['star_power'] += 1
+            db.save_user_data(user_id, user_data)
+            text = "✅ *Сила звёздности +1!*"
+        else:
+            text = "❌ Недостаточно средств! (100 ¢)"
+    
+    elif action == "buy_prod":
+        if user_data['balance'] >= 150:
+            db.update_balance(user_id, -150)
+            user_data['productivity'] = round(user_data['productivity'] * 1.1, 2)
+            db.save_user_data(user_id, user_data)
+            text = f"✅ *Урожайность увеличена!* ({user_data['productivity']})"
+        else:
+            text = "❌ Недостаточно средств! (150 ¢)"
+    
+    elif action == "buy_luck":
+        if user_data['balance'] >= 200:
+            db.update_balance(user_id, -200)
+            current_luck = user_data.get('luck', 1.0)
+            new_luck = round(current_luck + 0.1, 1)
+            db.set_luck(user_id, new_luck)
+            text = f"✅ *Удача увеличена!* ({new_luck:.1f}x)"
+        else:
+            text = "❌ Недостаточно средств! (200 ¢)"
+    
+    elif action == "buy_gold":
+        if user_data['balance'] >= 1500:
+            if db.buy_gold(user_id):
+                text = "✅ *GOLD подписка активирована!*"
+            else:
+                text = "❌ Ошибка!"
+        else:
+            text = "❌ Недостаточно средств! (1500 ¢)"
+    
+    await callback_query.message.edit_text(text, parse_mode="Markdown")
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data == "start_menu")
+async def start_callback(callback_query: CallbackQuery):
+    await start_cmd(callback_query.message)
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data == "profile")
+async def profile_callback(callback_query: CallbackQuery):
+    await profile_cmd(callback_query.message)
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data == "shop")
+async def shop_callback(callback_query: CallbackQuery):
+    await shop_cmd(callback_query.message)
+    await callback_query.answer()
+
+# =================== ЭВЕНТЫ ===================
+@dp.callback_query(lambda c: c.data == "event_start")
+async def event_start_callback(callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    chat_id = callback_query.message.chat.id
+    
+    global active_event
+    if active_event:
+        await callback_query.answer("❌ Уже есть активный эвент!", show_alert=True)
+        return
+    
+    if not await is_chat_admin(user_id, chat_id):
+        await callback_query.answer("❌ Только админы!", show_alert=True)
+        return
+    
+    if not db.check_gold(user_id):
+        await callback_query.answer("❌ Нужна GOLD подписка!", show_alert=True)
+        return
+    
+    event_types = [
+        ("🎯 Обычный", 100, 300, 1.0),
+        ("🚀 Средний", 300, 600, 1.0),
+        ("💎 Мега", 600, 1000, 1.2)
+    ]
+    etype, emin, emax, bonus = random.choice(event_types)
+    reward = random.randint(emin, emax)
+    event_id = random.randint(1000, 9999)
+    
+    active_event = {
+        'id': event_id, 'type': etype, 'reward': reward,
+        'end_time': datetime.now() + timedelta(hours=1),
+        'chat_id': chat_id, 'creator': user_id,
+        'bonus_value': bonus
+    }
+    event_participants[event_id] = []
+    
+    text = f"🎪 *Новый эвент!*\n\n🎯 {etype}\n💰 {reward} ¢\n⏳ 1 час\n\n*Присоединяйтесь!*"
+    
+    keyboard = InlineKeyboardBuilder()
+    keyboard.row(InlineKeyboardButton(text="🎪 Присоединиться", callback_data=f"join_event_{event_id}"))
+    await callback_query.message.edit_text(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
+    event_participants[event_id].append(user_id)
+    await callback_query.answer("✅ Эвент запущен!")
+
+@dp.callback_query(lambda c: c.data.startswith("join_event_"))
+async def join_event_callback(callback_query: CallbackQuery):
+    global active_event
+    if not active_event:
+        await callback_query.answer("❌ Нет активных эвентов!", show_alert=True)
+        return
+    
+    event_id = int(callback_query.data.replace("join_event_", ""))
+    if event_id != active_event['id']:
+        await callback_query.answer("❌ Эвент завершен!", show_alert=True)
+        return
+    
+    user_id = callback_query.from_user.id
+    if user_id in event_participants.get(active_event['id'], []):
+        await callback_query.answer("✅ Вы уже участвуете!", show_alert=True)
+        return
+    
+    event_participants[active_event['id']].append(user_id)
+    
+    # Бонус удачи для мега эвента
+    if active_event.get('bonus_value', 1.0) > 1.0:
+        db.set_event_bonus(user_id, active_event['id'], active_event['bonus_value'], active_event['end_time'])
+    
+    parts = len(event_participants[active_event['id']])
+    await callback_query.answer(f"🎉 Вы присоединились! ({parts} участников)", show_alert=True)
+    
+    text = (
+        f"🎪 *Эвент*\n\n"
+        f"🎯 {active_event['type']}\n"
+        f"💰 {active_event['reward']} ¢\n"
+        f"👥 {parts} участников\n"
+        f"⏳ {format_time(active_event['end_time'])}"
+    )
+    
+    keyboard = InlineKeyboardBuilder()
+    keyboard.row(InlineKeyboardButton(text="🎪 Присоединиться", callback_data=f"join_event_{active_event['id']}"))
+    await callback_query.message.edit_text(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
 
 # =================== ПАНЕЛЬ ВЛАДЕЛЬЦА ===================
 @dp.message(Command("owner"))
@@ -1118,87 +621,6 @@ async def owner_cmd(message: Message):
         await message.answer("⛔ Нет доступа!")
         return
     
-    # Проверяем, где отправлена команда
-    if message.chat.type == ChatType.PRIVATE:
-        # В ЛС показываем красивую панель
-        await show_owner_panel_private(message)
-    else:
-        # В группах показываем упрощенную панель
-        await show_owner_panel_group(message)
-
-async def show_owner_panel_private(message: Message):
-    """Красивая панель владельца в личных сообщениях"""
-    
-    # Создаем строки для рамки
-    content_lines = [
-        "╔════════════════════════════════════════╗",
-        "║                                        ║",
-        "║         👑 ПАНЕЛЬ ВЛАДЕЛЬЦА 👑         ║",
-        "║                                        ║",
-        "╠════════════════════════════════════════╣",
-        "║                                        ║",
-        "║   📊 *Статистика и мониторинг:*        ║",
-        "║   /stats - статистика бота             ║",
-        "║   /chats - список всех чатов           ║",
-        "║                                        ║",
-        "║   💰 *Управление балансами:*           ║",
-        "║   /give <id> <сумма> - выдать деньги   ║",
-        "║   /set <id> <сумма> - установить баланс║",
-        "║                                        ║",
-        "║   🎖️ *Управление подписками:*          ║",
-        "║   /gold <id> <дни> - выдать GOLD       ║",
-        "║   /gold_forever <id> - вечная GOLD     ║",
-        "║   /remove_gold <id> - удалить подписку ║",
-        "║                                        ║",
-        "║   🍀 *Управление удачей:*              ║",
-        "║   /luck <id> <значение> - удача        ║",
-        "║   /temp_luck <id> <зн> <мин> - врем.   ║",
-        "║   /luck_all <значение> - удача всем    ║",
-        "║   /luck_reset_all - сбросить всем      ║",
-        "║                                        ║",
-        "║   ⚙️ *Администрация:*                  ║",
-        "║   /ban <id> - забанить                 ║",
-        "║   /unban <id> - разбанить              ║",
-        "║   /resetcd <id> - сбросить кулдауны    ║",
-        "║                                        ║",
-        "║   📢 *Рассылка:*                       ║",
-        "║   /broadcast <текст> - отправить всем  ║",
-        "║                                        ║",
-        "║   🎪 *Эвенты:*                         ║",
-        "║   /owner_event - запустить эвент       ║",
-        "║   /stop_event - остановить эвент       ║",
-        "║                                        ║",
-        "╚════════════════════════════════════════╝"
-    ]
-    
-    text = "\n".join(content_lines)
-    
-    keyboard = InlineKeyboardBuilder()
-    keyboard.row(
-        InlineKeyboardButton(text="📊 Статистика", callback_data="refresh_stats"),
-        InlineKeyboardButton(text="📋 Список чатов", callback_data="all_chats_list")
-    )
-    keyboard.row(
-        InlineKeyboardButton(text="💰 Выдать деньги", callback_data="owner_give_prompt"),
-        InlineKeyboardButton(text="🎖️ Выдать GOLD", callback_data="owner_gold_prompt")
-    )
-    keyboard.row(
-        InlineKeyboardButton(text="🍀 Управление удачей", callback_data="owner_luck_menu"),
-        InlineKeyboardButton(text="📢 Рассылка", callback_data="owner_broadcast_prompt")
-    )
-    keyboard.row(
-        InlineKeyboardButton(text="⛔ Забанить", callback_data="owner_ban_prompt"),
-        InlineKeyboardButton(text="✅ Разбанить", callback_data="owner_unban_prompt")
-    )
-    keyboard.row(
-        InlineKeyboardButton(text="🎪 Запустить эвент", callback_data="owner_event_prompt"),
-        InlineKeyboardButton(text="🔄 Сбросить кд", callback_data="owner_resetcd_prompt")
-    )
-    
-    await message.answer(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
-
-async def show_owner_panel_group(message: Message):
-    """Панель владельца в группах"""
     text = (
         "👑 *Панель владельца*\n\n"
         "💰 *Управление балансами:*\n"
@@ -1206,84 +628,116 @@ async def show_owner_panel_group(message: Message):
         "/set <id> <сумма> - установить баланс\n\n"
         "🎖️ *Управление подписками:*\n"
         "/gold <id> <дни> - выдать GOLD\n"
-        "/gold_forever <id> - вечная GOLD\n"
-        "/remove_gold <id> - удалить подписку\n\n"
+        "/gold_forever <id> - вечная GOLD\n\n"
         "🍀 *Управление удачей:*\n"
-        "/luck <id> <значение> - установить удачу\n"
-        "/temp_luck <id> <значение> <минуты> - временная удача\n"
-        "/luck_all <значение> - удача всем\n"
-        "/luck_reset_all - сбросить удачу всем\n\n"
-        "⚙️ *Администрация:*\n"
-        "/ban <id> - забанить\n"
-        "/unban <id> - разбанить\n"
-        "/resetcd <id> - сбросить кулдауны\n\n"
+        "/luck <id> <значение> - удача\n"
+        "/temp_luck <id> <зн> <мин> - временная\n\n"
         "📢 *Рассылка:*\n"
         "/broadcast <текст> - отправить всем\n\n"
         "🎪 *Эвенты:*\n"
-        "/owner_event - запустить эвент\n"
-        "/stop_event - остановить эвент"
+        "/owner_event - запустить эвент"
     )
     
     keyboard = InlineKeyboardBuilder()
     keyboard.row(
         InlineKeyboardButton(text="📊 Статистика", callback_data="refresh_stats"),
-        InlineKeyboardButton(text="🍀 Управление удачей", callback_data="owner_luck_menu")
+        InlineKeyboardButton(text="📋 Список чатов", callback_data="all_chats_list")
     )
-    keyboard.row(
-        InlineKeyboardButton(text="💰 Выдать деньги", callback_data="owner_give_prompt"),
-        InlineKeyboardButton(text="📢 Рассылка", callback_data="owner_broadcast_prompt")
-    )
-    keyboard.row(InlineKeyboardButton(text="🔙 Назад", callback_data="profile"))
     
     await message.answer(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
 
-@dp.message(Command("chats"))
-async def chats_cmd(message: Message):
-    """Команда для просмотра списка чатов"""
+@dp.message(Command("stats"))
+async def stats_cmd(message: Message):
     if message.from_user.id != OWNER_ID:
         await message.answer("⛔ Нет доступа!")
         return
     
-    # Создаем фиктивный callback query для использования существующей функции
-    class MockCallbackQuery:
-        def __init__(self, message, from_user):
-            self.message = message
-            self.from_user = from_user
-            self.data = "all_chats_list"
-            self.chat_instance = ""
+    all_users = db.get_all_users()
+    all_chats = db.get_all_chats()
+    total_balance = sum(user.get('balance', 0) for user in all_users.values())
+    gold_users = sum(1 for user in all_users.values() if user.get('subscription') == 'gold')
     
-    mock_callback = MockCallbackQuery(message, message.from_user)
-    await all_chats_list_callback(mock_callback)
+    text = (
+        "📊 *Статистика бота*\n\n"
+        f"👥 Пользователей: {len(all_users)}\n"
+        f"💬 Чатов: {len(all_chats)}\n"
+        f"💰 Общий баланс: {total_balance:.2f} ¢\n"
+        f"🎖️ GOLD подписок: {gold_users}\n"
+        f"⏰ Активных эвентов: {1 if active_event else 0}"
+    )
+    
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.message(Command("chats"))
+async def chats_cmd(message: Message):
+    if message.from_user.id != OWNER_ID:
+        await message.answer("⛔ Нет доступа!")
+        return
+    
+    all_chats = db.get_all_chats()
+    text = "📋 *Список чатов*\n\n"
+    
+    for i, (chat_id, chat_data) in enumerate(list(all_chats.items())[:10]):
+        title = chat_data.get('title', f"Чат {chat_id}")
+        text += f"{i+1}. {title[:30]}\n"
+    
+    if len(all_chats) > 10:
+        text += f"\n...и еще {len(all_chats) - 10} чатов"
+    
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.callback_query(lambda c: c.data == "refresh_stats")
+async def refresh_stats_callback(callback_query: CallbackQuery):
+    if callback_query.from_user.id != OWNER_ID:
+        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
+        return
+    
+    message = Message(
+        message_id=callback_query.message.message_id,
+        date=datetime.now(),
+        chat=callback_query.message.chat,
+        from_user=callback_query.from_user,
+        text=""
+    )
+    await stats_cmd(message)
+    await callback_query.answer("✅ Обновлено!")
+
+@dp.callback_query(lambda c: c.data == "all_chats_list")
+async def all_chats_list_callback(callback_query: CallbackQuery):
+    if callback_query.from_user.id != OWNER_ID:
+        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
+        return
+    
+    all_chats = db.get_all_chats()
+    text = "📋 *Список чатов*\n\n"
+    
+    for i, (chat_id, chat_data) in enumerate(list(all_chats.items())[:20]):
+        title = chat_data.get('title', f"Чат {chat_id}")
+        last_active = datetime.fromisoformat(chat_data.get('last_activity', datetime.now().isoformat()))
+        delta = datetime.now() - last_active
+        if delta.days > 0: ago = f"{delta.days}д"
+        elif delta.seconds >= 3600: ago = f"{delta.seconds//3600}ч"
+        else: ago = f"{delta.seconds//60}м"
+        
+        text += f"{i+1}. {title[:25]} ({ago} назад)\n"
+    
+    await callback_query.message.edit_text(text, parse_mode="Markdown")
+    await callback_query.answer()
 
 @dp.message(Command("give"))
 async def give_money(message: Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID: 
-        return
+    if message.from_user.id != OWNER_ID: return
     try:
         args = command.args.split()
         user_id, amount = int(args[0]), float(args[1])
         db.update_balance(user_id, amount)
-        new = db.get_user_data(user_id)['balance']
-        await message.answer(f"✅ Выдано {amount} ¢\nНовый баланс: {new} ¢")
+        await message.answer(f"✅ Выдано {amount} ¢")
     except:
-        await message.answer("❌ Ошибка! Использование: /give <id> <сумма>")
-
-@dp.message(Command("set"))
-async def set_money(message: Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID: 
-        return
-    try:
-        args = command.args.split()
-        user_id, amount = int(args[0]), float(args[1])
-        db.set_balance(user_id, amount)
-        await message.answer(f"✅ Баланс установлен: {amount} ¢")
-    except:
-        await message.answer("❌ Ошибка! Использование: /set <id> <сумма>")
+        await message.answer("❌ Использование: /give <id> <сумма>")
 
 @dp.message(Command("gold"))
 async def give_gold(message: Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID: 
-        return
+    if message.from_user.id != OWNER_ID: return
     try:
         args = command.args.split()
         user_id = int(args[0])
@@ -1291,249 +745,44 @@ async def give_gold(message: Message, command: CommandObject):
         db.give_gold(user_id, days)
         await message.answer(f"✅ GOLD на {days} дней выдана")
     except:
-        await message.answer("❌ Ошибка! Использование: /gold <id> <дни>")
+        await message.answer("❌ Использование: /gold <id> <дни>")
 
-@dp.message(Command("gold_forever"))
-async def gold_forever(message: Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID: 
-        return
-    try:
-        user_id = int(command.args)
-        db.give_gold(user_id, permanent=True)
-        await message.answer(f"✅ Вечная GOLD выдана")
-    except:
-        await message.answer("❌ Ошибка! Использование: /gold_forever <id>")
-
-@dp.message(Command("remove_gold"))
-async def remove_gold_cmd(message: Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID: 
-        return
-    try:
-        user_id = int(command.args)
-        db.remove_gold(user_id)
-        await message.answer(f"✅ GOLD удалена")
-    except:
-        await message.answer("❌ Ошибка! Использование: /remove_gold <id>")
-
-@dp.message(Command("ban"))
-async def ban_cmd(message: Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID: 
-        return
-    try:
-        user_id = int(command.args)
-        db.ban_user(user_id, True)
-        await message.answer(f"⛔ Пользователь забанен")
-    except:
-        await message.answer("❌ Ошибка! Использование: /ban <id>")
-
-@dp.message(Command("unban"))
-async def unban_cmd(message: Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID: 
-        return
-    try:
-        user_id = int(command.args)
-        db.ban_user(user_id, False)
-        await message.answer(f"✅ Пользователь разбанен")
-    except:
-        await message.answer("❌ Ошибка! Использование: /unban <id>")
-
-@dp.message(Command("resetcd"))
-async def reset_cd(message: Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID: 
-        return
-    try:
-        user_id = int(command.args)
-        db.clear_cooldowns(user_id)
-        await message.answer(f"✅ Кулдауны сброшены")
-    except:
-        await message.answer("❌ Ошибка! Использование: /resetcd <id>")
-
-# =================== УПРАВЛЕНИЕ УДАЧЕЙ ===================
 @dp.message(Command("luck"))
 async def set_luck_cmd(message: Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID: 
-        return
+    if message.from_user.id != OWNER_ID: return
     try:
         args = command.args.split()
-        user_id = int(args[0])
-        luck_value = float(args[1])
-        
-        if luck_value < 1.0 or luck_value > 100.0:
-            await message.answer("❌ Удача должна быть от 1.0 до 100.0!")
-            return
-            
+        user_id, luck_value = int(args[0]), float(args[1])
+        luck_value = max(1.0, min(100.0, luck_value))
         db.set_luck(user_id, luck_value)
-        await message.answer(f"✅ Постоянная удача установлена: {luck_value:.1f}x\nДля пользователя: {user_id}")
+        await message.answer(f"✅ Удача {luck_value:.1f}x установлена")
     except:
-        await message.answer("❌ Ошибка! Использование: /luck <id> <значение> (1.0-100.0)")
-
-@dp.message(Command("temp_luck"))
-async def set_temp_luck_cmd(message: Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID: 
-        return
-    try:
-        args = command.args.split()
-        user_id = int(args[0])
-        luck_value = float(args[1])
-        minutes = int(args[2]) if len(args) > 2 else 5
-        
-        if luck_value < 1.0 or luck_value > 100.0:
-            await message.answer("❌ Удача должна быть от 1.0 до 100.0!")
-            return
-            
-        if minutes < 1 or minutes > 1440:
-            await message.answer("❌ Минуты должны быть от 1 до 1440 (24 часа)!")
-            return
-        
-        db.set_temp_luck(user_id, luck_value, minutes)
-        
-        luck_info = db.get_user_luck_info(user_id)
-        base_luck = luck_info['base_luck']
-        effective_luck = luck_info['effective_luck']
-        
-        await message.answer(
-            f"✅ Временная удача установлена!\n\n"
-            f"👤 Пользователь: {user_id}\n"
-            f"🍀 Удача: {luck_value:.1f}x\n"
-            f"⏳ Длительность: {format_minutes(minutes)}\n"
-            f"📊 Базовая удача: {base_luck:.1f}x\n"
-            f"🎯 Эффективная удача: {effective_luck:.1f}x"
-        )
-    except Exception as e:
-        await message.answer(f"❌ Ошибка! Использование: /temp_luck <id> <значение> [минуты]\nПример: /temp_luck 123456789 10.0 5")
-
-@dp.message(Command("luck_all"))
-async def set_luck_all_cmd(message: Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID: 
-        return
-    try:
-        if not command.args:
-            await message.answer("❌ Укажите значение удачи!\n/luck_all <значение>")
-            return
-        
-        luck_value = float(command.args)
-        
-        if luck_value < 1.0 or luck_value > 100.0:
-            await message.answer("❌ Удача должна быть от 1.0 до 100.0!")
-            return
-        
-        keyboard = InlineKeyboardBuilder()
-        keyboard.row(
-            InlineKeyboardButton(text="✅ Да, установить всем", callback_data=f"luck_all_confirm_{luck_value}"),
-            InlineKeyboardButton(text="❌ Отмена", callback_data="owner_panel")
-        )
-        
-        await message.answer(
-            f"⚠️ *ВНИМАНИЕ!*\n\n"
-            f"Вы собираетесь установить удачу {luck_value:.1f}x ВСЕМ пользователям.\n\n"
-            f"❓ Подтвердить действие?",
-            reply_markup=keyboard.as_markup()
-        )
-    except:
-        await message.answer("❌ Ошибка! Использование: /luck_all <значение> (1.0-100.0)")
-
-@dp.message(Command("luck_reset_all"))
-async def reset_luck_all_cmd(message: Message):
-    if message.from_user.id != OWNER_ID: 
-        return
-    
-    keyboard = InlineKeyboardBuilder()
-    keyboard.row(
-        InlineKeyboardButton(text="✅ Да, сбросить всем", callback_data="luck_reset_all_confirm"),
-        InlineKeyboardButton(text="❌ Отмена", callback_data="owner_panel")
-    )
-    
-    await message.answer(
-        f"⚠️ *ВНИМАНИЕ!*\n\n"
-        f"Вы собираетесь сбросить удачу у ВСЕХ пользователей до 1.0x.\n\n"
-        f"❓ Подтвердить действие?",
-        reply_markup=keyboard.as_markup()
-    )
+        await message.answer("❌ Использование: /luck <id> <значение>")
 
 @dp.message(Command("broadcast"))
 async def broadcast_cmd(message: Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID: 
-        return
+    if message.from_user.id != OWNER_ID: return
     
     if not command.args:
-        await message.answer("❌ Укажите текст для рассылки!\n/broadcast <текст>")
+        await message.answer("❌ Укажите текст!")
         return
     
     broadcast_text = command.args
+    all_users = db.get_all_users()
+    sent = 0
     
-    keyboard = InlineKeyboardBuilder()
-    keyboard.row(
-        InlineKeyboardButton(text="✅ Да, отправить всем", callback_data=f"broadcast_confirm_{message.message_id}"),
-        InlineKeyboardButton(text="❌ Отмена", callback_data="owner_panel")
-    )
+    await message.answer(f"📢 Рассылка началась ({len(all_users)} пользователей)...")
     
-    await message.answer(
-        f"📢 *Рассылка для всех пользователей:*\n\n"
-        f"{broadcast_text}\n\n"
-        f"❓ Отправить всем пользователям?",
-        reply_markup=keyboard.as_markup()
-    )
-
-# =================== ЭВЕНТЫ ===================
-@dp.message(Command("event_start"))
-async def event_start_cmd(message: Message):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
+    for user_id in all_users.keys():
+        try:
+            await bot.send_message(user_id, f"📢 *Сообщение от администратора:*\n\n{broadcast_text}", parse_mode="Markdown")
+            sent += 1
+            if sent % 10 == 0:
+                await asyncio.sleep(1)
+        except:
+            pass
     
-    if user_id != OWNER_ID and not db.get_channel_check(user_id):
-        await message.answer("❌ Сначала подпишитесь! /check")
-        return
-    
-    if not await is_chat_admin(user_id, chat_id):
-        await message.answer("❌ Только админы чата!")
-        return
-    
-    if not db.check_gold(user_id):
-        await message.answer("❌ Нужна GOLD подписка! /shop")
-        return
-    
-    global active_event
-    if active_event:
-        await message.answer("❌ Уже есть активный эвент!")
-        return
-    
-    event_types = [
-        ("🎯 Обычный", 100, 300, "Обычный эвент", 1.0),
-        ("🚀 Средний", 300, 600, "Средний эвент", 1.0),
-        ("💎 Мега", 600, 1000, "Мега эвент с бонусом удачи!", 1.2)
-    ]
-    etype, emin, emax, edesc, bonus_value = random.choice(event_types)
-    reward = random.randint(emin, emax)
-    event_id = random.randint(1000, 9999)
-    end_time = datetime.now() + timedelta(hours=1)
-    
-    active_event = {
-        'id': event_id,
-        'type': etype,
-        'reward': reward,
-        'end_time': end_time,
-        'chat_id': chat_id,
-        'creator': user_id,
-        'description': edesc,
-        'bonus_value': bonus_value
-    }
-    event_participants[event_id] = []
-    
-    text = (
-        f"🎪 *Новый эвент!*\n\n"
-        f"🎯 *{etype}*\n"
-        f"💰 *{reward} ¢*\n"
-        f"⏳ *1 час*\n"
-        f"📝 *{edesc}*\n"
-        f"🆔 *{event_id}*\n\n"
-        f"*Присоединиться:* нажмите кнопку ниже"
-    )
-    
-    keyboard = InlineKeyboardBuilder()
-    keyboard.row(InlineKeyboardButton(text="🎪 ПРИСОЕДИНИТЬСЯ", callback_data=f"join_event_{event_id}"))
-    
-    await message.answer(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
-    event_participants[event_id].append(user_id)
+    await message.answer(f"✅ Рассылка завершена!\nОтправлено: {sent}/{len(all_users)}")
 
 @dp.message(Command("owner_event"))
 async def owner_event_cmd(message: Message):
@@ -1547,888 +796,32 @@ async def owner_event_cmd(message: Message):
         return
     
     event_types = [
-        ("🎯 Обычный", 100, 300, "Обычный эвент", 1.0),
-        ("🚀 Средний", 300, 600, "Средний эвент", 1.0),
-        ("💎 Мега", 600, 1000, "Мега эвент с бонусом удачи!", 1.2)
+        ("🎯 Обычный", 100, 300, 1.0),
+        ("🚀 Средний", 300, 600, 1.0),
+        ("💎 Мега", 600, 1000, 1.2)
     ]
-    etype, emin, emax, edesc, bonus_value = random.choice(event_types)
+    etype, emin, emax, bonus = random.choice(event_types)
     reward = random.randint(emin, emax)
     event_id = random.randint(1000, 9999)
-    end_time = datetime.now() + timedelta(hours=1)
     
     active_event = {
-        'id': event_id,
-        'type': etype,
-        'reward': reward,
-        'end_time': end_time,
-        'chat_id': message.chat.id,
-        'creator': OWNER_ID,
-        'description': edesc,
-        'bonus_value': bonus_value
+        'id': event_id, 'type': etype, 'reward': reward,
+        'end_time': datetime.now() + timedelta(hours=1),
+        'chat_id': message.chat.id, 'creator': OWNER_ID,
+        'bonus_value': bonus
     }
     event_participants[event_id] = []
     
-    text = (
-        f"🎪 *Владелец запустил эвент!*\n\n"
-        f"🎯 *{etype}*\n"
-        f"💰 *{reward} ¢*\n"
-        f"⏳ *1 час*\n"
-        f"📝 *{edesc}*\n"
-        f"🆔 *{event_id}*\n\n"
-        f"*Присоединиться:* нажмите кнопку ниже"
-    )
+    text = f"🎪 *Владелец запустил эвент!*\n\n🎯 {etype}\n💰 {reward} ¢\n⏳ 1 час\n\n*Присоединяйтесь!*"
     
     keyboard = InlineKeyboardBuilder()
-    keyboard.row(InlineKeyboardButton(text="🎪 ПРИСОЕДИНИТЬСЯ", callback_data=f"join_event_{event_id}"))
-    
+    keyboard.row(InlineKeyboardButton(text="🎪 Присоединиться", callback_data=f"join_event_{event_id}"))
     await message.answer(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
     event_participants[event_id].append(OWNER_ID)
 
-@dp.message(Command("stop_event"))
-async def stop_event_cmd(message: Message):
-    if message.from_user.id != OWNER_ID:
-        await message.answer("⛔ Нет доступа!")
-        return
-    
-    global active_event
-    if not active_event:
-        await message.answer("❌ Нет активных эвентов!")
-        return
-    
-    active_event = None
-    await message.answer("✅ Эвент остановлен!")
-
-@dp.message(Command("join"))
-async def join_event_cmd(message: Message, command: CommandObject):
-    global active_event
-    
-    if not active_event:
-        await message.answer("❌ Нет активных эвентов!")
-        return
-    
-    if not command.args:
-        await message.answer(f"Использование: /join {active_event['id']}")
-        return
-    
-    if int(command.args) != active_event['id']:
-        await message.answer("❌ Неверный ID эвента!")
-        return
-    
-    user_id = message.from_user.id
-    
-    if active_event['creator'] != OWNER_ID and active_event.get('chat_id') != message.chat.id:
-        await message.answer("❌ Этот эвент в другом чате!")
-        return
-    
-    if user_id in event_participants.get(active_event['id'], []):
-        await message.answer("✅ Вы уже участвуете!")
-        return
-    
-    event_participants[active_event['id']].append(user_id)
-    parts = len(event_participants[active_event['id']])
-    time_left = format_time(active_event['end_time'])
-    
-    # Если это эвент с бонусом, даём бонус удачи до конца эвента
-    bonus_value = active_event.get('bonus_value', 1.0)
-    if bonus_value > 1.0:
-        db.set_event_bonus(user_id, active_event['id'], bonus_value, active_event['end_time'])
-        bonus_percent = (bonus_value - 1) * 100
-        bonus_text = f"\n✨ *Вы получили бонус: +{bonus_percent:.0f}% к удаче до конца эвента!*"
-    else:
-        bonus_text = ""
-    
-    await message.answer(
-        f"🎉 *Вы присоединились!*\n\n"
-        f"🎯 *{active_event['type']}*\n"
-        f"💰 *{active_event['reward']} ¢*\n"
-        f"👥 *{parts} участников*\n"
-        f"⏳ *{time_left}*"
-        f"{bonus_text}"
-    )
-
-# =================== ФАРМ КОМАНДЫ ===================
-@dp.message(lambda msg: msg.text and msg.text.lower() in FARM_COMMANDS)
-async def farm_command(message: Message):
-    user_id = message.from_user.id
-    cmd = message.text.lower()
-    
-    # НЕЛЬЗЯ ФАРМИТЬ В ЛИЧНЫХ СООБЩЕНИЯХ
-    if message.chat.type == ChatType.PRIVATE:
-        await message.answer("⛔ Фарм доступен только в группах и чатах!\n\nСоздайте группу и добавьте бота туда.")
-        return
-    
-    if db.is_banned(user_id):
-        await message.answer("⛔ Вы забанены!")
-        return
-    
-    if user_id != OWNER_ID and not db.get_channel_check(user_id):
-        await message.answer("❌ Сначала подпишитесь на канал! /check")
-        return
-    
-    cd = db.get_cooldown(user_id, cmd)
-    if cd:
-        await message.reply(f"⏳ {cmd} на кулдауне!\n\nВозвращайтесь через {format_time(cd)}")
-        return
-    
-    # Увеличиваем счетчик фарм-команд
-    db.increment_stat('total_farm_commands')
-    
-    user_data = db.get_user_data(user_id)
-    cmd_info = FARM_COMMANDS[cmd]
-    
-    effective_luck = db.get_effective_luck(user_id)
-    base_luck = user_data.get('luck', 1.0)
-    temp_luck_info = db.get_temp_luck_info(user_id)
-    event_bonus_info = db.get_event_bonus_info(user_id)
-    
-    base_min = cmd_info["min"]
-    base_max = cmd_info["max"]
-    
-    luck_multiplier = 1.0 + (effective_luck - 1.0) * 0.1
-    
-    if random.random() < 0.3:
-        reward = random.randint(base_min, int(base_max * luck_multiplier))
-        luck_used = True
-    else:
-        reward = random.randint(base_min, base_max)
-        luck_used = False
-    
-    reward += user_data['star_power'] * 0.5
-    reward *= user_data['productivity']
-    
-    if db.check_gold(user_id):
-        reward *= 1.2
-    
-    if random.random() < 0.26:
-        bonus = random.randint(5, 15)
-        reward += bonus
-        bonus_text = f"☢️ +{bonus} ¢\n"
-    else:
-        bonus_text = ""
-    
-    reward = round(reward, 2)
-    
-    db.update_balance(user_id, reward)
-    db.set_cooldown(user_id, cmd, hours=2)
-    
-    new_balance = db.get_user_data(user_id)['balance']
-    
-    luck_text = ""
-    if luck_used:
-        luck_text = f"🍀 Удача {effective_luck:.1f}x помогла!\n"
-        
-        if temp_luck_info and effective_luck > base_luck:
-            time_left = format_time(temp_luck_info['end_time'])
-            luck_text += f"⏳ Временная удача закончится через: {time_left}\n"
-        
-        if event_bonus_info:
-            bonus_percent = (event_bonus_info['value'] - 1) * 100
-            time_left = format_time(event_bonus_info['end_time'])
-            luck_text += f"✨ Бонус от эвента: +{bonus_percent:.0f}% к удаче!\n⏳ Осталось: {time_left}\n"
-    
-    response = (
-        f"{cmd_info['emoji']} {cmd.upper()} ✅ *ЗАЧЁТ!*\n\n"
-        f"{luck_text}"
-        f"💰 *+{reward:.2f} ¢*\n"
-        f"{bonus_text}"
-        f"\n💳 *Баланс:* {new_balance:.2f} ¢\n\n"
-        f"⏳ *Возвращайтесь через 2 часа*"
-    )
-    
-    await message.reply(response, parse_mode="Markdown")
-
-# =================== CALLBACK ОБРАБОТЧИКИ ===================
-@dp.callback_query(lambda c: c.data == "start_menu")
-async def start_callback(callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    
-    if db.is_banned(user_id):
-        await callback_query.answer("⛔ Вы забанены!", show_alert=True)
-        return
-    
-    # Создаем сообщение для обработки
-    message = Message(
-        message_id=callback_query.message.message_id,
-        date=datetime.now(),
-        chat=callback_query.message.chat,
-        from_user=callback_query.from_user,
-        text=""
-    )
-    
-    await start_cmd(message)
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data == "profile")
-async def profile_callback(callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    
-    if user_id != OWNER_ID and not db.get_channel_check(user_id):
-        await callback_query.answer("❌ Сначала подпишитесь на канал!", show_alert=True)
-        return
-    
-    # Создаем сообщение для обработки
-    message = Message(
-        message_id=callback_query.message.message_id,
-        date=datetime.now(),
-        chat=callback_query.message.chat,
-        from_user=callback_query.from_user,
-        text=""
-    )
-    
-    await profile_cmd(message)
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data == "shop")
-async def shop_callback(callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    
-    if user_id != OWNER_ID and not db.get_channel_check(user_id):
-        await callback_query.answer("❌ Сначала подпишитесь!", show_alert=True)
-        return
-    
-    # Создаем сообщение для обработки
-    message = Message(
-        message_id=callback_query.message.message_id,
-        date=datetime.now(),
-        chat=callback_query.message.chat,
-        from_user=callback_query.from_user,
-        text=""
-    )
-    
-    await shop_cmd(message)
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data == "events")
-async def events_callback(callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    
-    if user_id != OWNER_ID and not db.get_channel_check(user_id):
-        await callback_query.answer("❌ Сначала подпишитесь!", show_alert=True)
-        return
-    
-    # Создаем сообщение для обработки
-    message = Message(
-        message_id=callback_query.message.message_id,
-        date=datetime.now(),
-        chat=callback_query.message.chat,
-        from_user=callback_query.from_user,
-        text=""
-    )
-    
-    await events_cmd(message)
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data == "help_menu")
-async def help_callback(callback_query: CallbackQuery):
-    # Создаем сообщение для обработки
-    message = Message(
-        message_id=callback_query.message.message_id,
-        date=datetime.now(),
-        chat=callback_query.message.chat,
-        from_user=callback_query.from_user,
-        text=""
-    )
-    
-    await help_cmd(message)
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data == "owner_panel")
-async def owner_panel_callback(callback_query: CallbackQuery):
-    if callback_query.from_user.id != OWNER_ID:
-        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
-        return
-    
-    # Создаем сообщение для обработки
-    message = Message(
-        message_id=callback_query.message.message_id,
-        date=datetime.now(),
-        chat=callback_query.message.chat,
-        from_user=callback_query.from_user,
-        text=""
-    )
-    
-    await owner_cmd(message)
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data.startswith("farm_"))
-async def farm_button_callback(callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    cmd = callback_query.data.replace("farm_", "")
-    
-    if callback_query.message.chat.type == ChatType.PRIVATE:
-        await callback_query.answer("⛔ Фарм доступен только в группах!", show_alert=True)
-        return
-    
-    cmd_map = {
-        "cactus": "кактус",
-        "farm": "ферма",
-        "mine": "шахта",
-        "garden": "сад",
-        "hunt": "охота"
-    }
-    
-    if cmd not in cmd_map:
-        await callback_query.answer("❌ Неизвестная команда")
-        return
-    
-    cmd_name = cmd_map[cmd]
-    
-    if db.is_banned(user_id):
-        await callback_query.answer("⛔ Вы забанены!", show_alert=True)
-        return
-    
-    if user_id != OWNER_ID and not db.get_channel_check(user_id):
-        await callback_query.answer("❌ Сначала подпишитесь на канал!", show_alert=True)
-        return
-    
-    cd = db.get_cooldown(user_id, cmd_name)
-    if cd:
-        await callback_query.answer(f"⏳ {cmd_name} на кулдауне! {format_time(cd)}", show_alert=True)
-        return
-    
-    # Увеличиваем счетчик фарм-команд
-    db.increment_stat('total_farm_commands')
-    
-    user_data = db.get_user_data(user_id)
-    cmd_info = FARM_COMMANDS[cmd_name]
-    
-    effective_luck = db.get_effective_luck(user_id)
-    base_luck = user_data.get('luck', 1.0)
-    temp_luck_info = db.get_temp_luck_info(user_id)
-    event_bonus_info = db.get_event_bonus_info(user_id)
-    
-    base_min = cmd_info["min"]
-    base_max = cmd_info["max"]
-    
-    luck_multiplier = 1.0 + (effective_luck - 1.0) * 0.1
-    
-    if random.random() < 0.3:
-        reward = random.randint(base_min, int(base_max * luck_multiplier))
-        luck_used = True
-    else:
-        reward = random.randint(base_min, base_max)
-        luck_used = False
-    
-    reward += user_data['star_power'] * 0.5
-    reward *= user_data['productivity']
-    
-    if db.check_gold(user_id):
-        reward *= 1.2
-    
-    if random.random() < 0.26:
-        bonus = random.randint(5, 15)
-        reward += bonus
-        bonus_text = f"☢️ +{bonus} ¢\n"
-    else:
-        bonus_text = ""
-    
-    reward = round(reward, 2)
-    
-    db.update_balance(user_id, reward)
-    db.set_cooldown(user_id, cmd_name, hours=2)
-    
-    new_balance = db.get_user_data(user_id)['balance']
-    
-    luck_text = ""
-    if luck_used:
-        luck_text = f"🍀 Удача {effective_luck:.1f}x помогла!\n"
-        
-        if temp_luck_info and effective_luck > base_luck:
-            time_left = format_time(temp_luck_info['end_time'])
-            luck_text += f"⏳ Временная удача закончится через: {time_left}\n"
-        
-        if event_bonus_info:
-            bonus_percent = (event_bonus_info['value'] - 1) * 100
-            time_left = format_time(event_bonus_info['end_time'])
-            luck_text += f"✨ Бонус от эвента: +{bonus_percent:.0f}% к удаче!\n⏳ Осталось: {time_left}\n"
-    
-    response = (
-        f"{cmd_info['emoji']} {cmd_name.upper()} ✅ *ЗАЧЁТ!*\n\n"
-        f"{luck_text}"
-        f"💰 *+{reward:.2f} ¢*\n"
-        f"{bonus_text}"
-        f"\n💳 *Баланс:* {new_balance:.2f} ¢\n\n"
-        f"⏳ *Возвращайтесь через 2 часа*"
-    )
-    
-    await callback_query.message.answer(response, parse_mode="Markdown")
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data in ["buy_star", "buy_prod", "buy_luck", "buy_gold"])
-async def buy_callback(callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    action = callback_query.data
-    
-    if action == "buy_star":
-        user_data = db.get_user_data(user_id)
-        if user_data['balance'] >= 100:
-            db.update_balance(user_id, -100)
-            user_data['star_power'] += 1
-            db.save_user_data(user_id, user_data)
-            text = "✅ *Сила звёздности +1!*\n\nТеперь +0.5 ¢ к каждой награде!"
-        else:
-            text = "❌ *Недостаточно средств!*\n\nНужно: 100 ¢"
-    
-    elif action == "buy_prod":
-        user_data = db.get_user_data(user_id)
-        if user_data['balance'] >= 150:
-            db.update_balance(user_id, -150)
-            user_data['productivity'] = round(user_data['productivity'] * 1.1, 2)
-            db.save_user_data(user_id, user_data)
-            text = f"✅ *Урожайность увеличена!*\n\nТеперь: {user_data['productivity']}"
-        else:
-            text = "❌ *Недостаточно средств!*\n\nНужно: 150 ¢"
-    
-    elif action == "buy_luck":
-        user_data = db.get_user_data(user_id)
-        if user_data['balance'] >= 200:
-            db.update_balance(user_id, -200)
-            current_luck = user_data.get('luck', 1.0)
-            new_luck = round(current_luck + 0.1, 1)
-            db.set_luck(user_id, new_luck)
-            text = f"✅ *Удача увеличена!*\n\nТеперь: {new_luck:.1f}x"
-        else:
-            text = "❌ *Недостаточно средств!*\n\nНужно: 200 ¢"
-    
-    elif action == "buy_gold":
-        user_data = db.get_user_data(user_id)
-        if user_data['balance'] >= 1500:
-            if db.buy_gold(user_id):
-                text = "✅ *GOLD подписка активирована!*\n\n+20% к наградам на 30 дней!"
-            else:
-                text = "❌ Ошибка!"
-        else:
-            text = "❌ *Недостаточно средств!*\n\nНужно: 1500 ¢"
-    
-    await callback_query.message.edit_text(text, parse_mode="Markdown")
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data == "owner_luck_menu")
-async def owner_luck_menu_callback(callback_query: CallbackQuery):
-    if callback_query.from_user.id != OWNER_ID:
-        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
-        return
-    
-    text = (
-        "🍀 *Управление удачей*\n\n"
-        "📋 *Команды:*\n"
-        "1. /luck <id> <значение> - постоянная удача\n"
-        "2. /temp_luck <id> <значение> <минуты> - временная удача\n"
-        "3. /luck_all <значение> - удача всем\n"
-        "4. /luck_reset_all - сбросить удачу всем\n\n"
-        "📊 *Примеры:*\n"
-        "/luck 123456789 10.0 - удача 10x\n"
-        "/temp_luck 123456789 50.0 10 - удача 50x на 10 мин\n"
-        "/luck_all 5.0 - всем удача 5x\n"
-        "/luck_reset_all - сбросить всем"
-    )
-    
-    keyboard = InlineKeyboardBuilder()
-    keyboard.row(
-        InlineKeyboardButton(text="🎲 Удача всем", callback_data="owner_luck_all_prompt"),
-        InlineKeyboardButton(text="🔄 Сбросить всем", callback_data="owner_luck_reset_prompt")
-    )
-    keyboard.row(
-        InlineKeyboardButton(text="⏱️ Временная удача", callback_data="owner_temp_luck_prompt"),
-        InlineKeyboardButton(text="🔙 Назад", callback_data="owner_panel")
-    )
-    
-    await callback_query.message.edit_text(text, reply_markup=keyboard.as_markup())
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data == "owner_luck_all_prompt")
-async def owner_luck_all_prompt_callback(callback_query: CallbackQuery):
-    if callback_query.from_user.id != OWNER_ID:
-        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
-        return
-    
-    await callback_query.message.answer(
-        "🎲 *Установить удачу ВСЕМ пользователям*\n\n"
-        "Введите команду:\n"
-        "/luck_all <значение>\n\n"
-        "Пример: /luck_all 10.0\n\n"
-        "⚠️ *Внимание: Это действие нельзя отменить!*",
-        parse_mode="Markdown"
-    )
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data == "owner_luck_reset_prompt")
-async def owner_luck_reset_prompt_callback(callback_query: CallbackQuery):
-    if callback_query.from_user.id != OWNER_ID:
-        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
-        return
-    
-    await callback_query.message.answer(
-        "🔄 *Сбросить удачу у ВСЕХ пользователей*\n\n"
-        "Введите команду:\n"
-        "/luck_reset_all\n\n"
-        "⚠️ *Внимание: Это действие нельзя отменить!*",
-        parse_mode="Markdown"
-    )
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data == "owner_temp_luck_prompt")
-async def owner_temp_luck_prompt_callback(callback_query: CallbackQuery):
-    if callback_query.from_user.id != OWNER_ID:
-        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
-        return
-    
-    await callback_query.message.answer(
-        "⏱️ *Установить временную удачу*\n\n"
-        "Введите команду:\n"
-        "/temp_luck <id> <значение> <минуты>\n\n"
-        "📊 *Примеры:*\n"
-        "/temp_luck 123456789 5.0 5 - удача 5x на 5 минут\n"
-        "/temp_luck 123456789 100.0 60 - удача 100x на 1 час\n\n"
-        "📊 *Эффект:* Временная удача заменяет постоянную на указанное время.",
-        parse_mode="Markdown"
-    )
-    await callback_query.answer()
-
-# =================== ПРОМПТЫ ДЛЯ УПРАВЛЕНИЯ В ЛС ===================
-@dp.callback_query(lambda c: c.data == "owner_give_prompt")
-async def owner_give_prompt_callback(callback_query: CallbackQuery):
-    if callback_query.from_user.id != OWNER_ID:
-        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
-        return
-    
-    await callback_query.message.answer(
-        "💰 *Выдать деньги пользователю*\n\n"
-        "Введите команду:\n"
-        "/give <id> <сумма>\n\n"
-        "📊 *Пример:*\n"
-        "/give 123456789 1000\n\n"
-        "📝 *Примечание:* Можно использовать в ЛС для управления ботом",
-        parse_mode="Markdown"
-    )
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data == "owner_gold_prompt")
-async def owner_gold_prompt_callback(callback_query: CallbackQuery):
-    if callback_query.from_user.id != OWNER_ID:
-        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
-        return
-    
-    await callback_query.message.answer(
-        "🎖️ *Выдать GOLD подписку*\n\n"
-        "Введите команду:\n"
-        "/gold <id> [дни]\n\n"
-        "📊 *Примеры:*\n"
-        "/gold 123456789 30 - GOLD на 30 дней\n"
-        "/gold_forever 123456789 - вечная GOLD\n"
-        "/remove_gold 123456789 - удалить подписку\n\n"
-        "📝 *Примечание:* По умолчанию 30 дней",
-        parse_mode="Markdown"
-    )
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data == "owner_broadcast_prompt")
-async def owner_broadcast_prompt_callback(callback_query: CallbackQuery):
-    if callback_query.from_user.id != OWNER_ID:
-        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
-        return
-    
-    await callback_query.message.answer(
-        "📢 *Рассылка сообщений*\n\n"
-        "Введите команду:\n"
-        "/broadcast <текст сообщения>\n\n"
-        "📊 *Пример:*\n"
-        "/broadcast Важное обновление! Добавлены новые функции.\n\n"
-        "⚠️ *Внимание:* Сообщение будет отправлено всем пользователям бота",
-        parse_mode="Markdown"
-    )
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data == "owner_ban_prompt")
-async def owner_ban_prompt_callback(callback_query: CallbackQuery):
-    if callback_query.from_user.id != OWNER_ID:
-        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
-        return
-    
-    await callback_query.message.answer(
-        "⛔ *Забанить пользователя*\n\n"
-        "Введите команду:\n"
-        "/ban <id>\n\n"
-        "📊 *Пример:*\n"
-        "/ban 123456789\n\n"
-        "📝 *Для разбанивания:* /unban <id>",
-        parse_mode="Markdown"
-    )
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data == "owner_unban_prompt")
-async def owner_unban_prompt_callback(callback_query: CallbackQuery):
-    if callback_query.from_user.id != OWNER_ID:
-        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
-        return
-    
-    await callback_query.message.answer(
-        "✅ *Разбанить пользователя*\n\n"
-        "Введите команду:\n"
-        "/unban <id>\n\n"
-        "📊 *Пример:*\n"
-        "/unban 123456789\n\n"
-        "📝 *Для бана:* /ban <id>",
-        parse_mode="Markdown"
-    )
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data == "owner_event_prompt")
-async def owner_event_prompt_callback(callback_query: CallbackQuery):
-    if callback_query.from_user.id != OWNER_ID:
-        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
-        return
-    
-    await callback_query.message.answer(
-        "🎪 *Запустить эвент*\n\n"
-        "Введите команду:\n"
-        "/owner_event\n\n"
-        "📊 *Для остановки эвента:*\n"
-        "/stop_event\n\n"
-        "⚠️ *Внимание:* Эвент запустится в текущем чате",
-        parse_mode="Markdown"
-    )
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data == "owner_resetcd_prompt")
-async def owner_resetcd_prompt_callback(callback_query: CallbackQuery):
-    if callback_query.from_user.id != OWNER_ID:
-        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
-        return
-    
-    await callback_query.message.answer(
-        "🔄 *Сбросить кулдауны пользователю*\n\n"
-        "Введите команду:\n"
-        "/resetcd <id>\n\n"
-        "📊 *Пример:*\n"
-        "/resetcd 123456789\n\n"
-        "📝 *Примечание:* Сбрасывает все кулдауны фарм-команд",
-        parse_mode="Markdown"
-    )
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data.startswith("luck_all_confirm_"))
-async def luck_all_confirm_callback(callback_query: CallbackQuery):
-    if callback_query.from_user.id != OWNER_ID:
-        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
-        return
-    
-    try:
-        luck_value = float(callback_query.data.replace("luck_all_confirm_", ""))
-        user_count = db.set_luck_all(luck_value)
-        
-        await callback_query.message.edit_text(
-            f"✅ *Удача установлена ВСЕМ пользователям!*\n\n"
-            f"🍀 *Значение:* {luck_value:.1f}x\n"
-            f"👥 *Затронуто пользователей:* {user_count}",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        await callback_query.message.edit_text(f"❌ Ошибка: {e}")
-    
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data == "luck_reset_all_confirm")
-async def luck_reset_all_confirm_callback(callback_query: CallbackQuery):
-    if callback_query.from_user.id != OWNER_ID:
-        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
-        return
-    
-    try:
-        user_count = db.remove_luck_all()
-        
-        await callback_query.message.edit_text(
-            f"✅ *Удача сброшена у ВСЕХ пользователей!*\n\n"
-            f"🍀 *Теперь у всех:* 1.0x\n"
-            f"👥 *Затронуто пользователей:* {user_count}",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        await callback_query.message.edit_text(f"❌ Ошибка: {e}")
-    
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data.startswith("broadcast_confirm_"))
-async def broadcast_confirm_callback(callback_query: CallbackQuery):
-    if callback_query.from_user.id != OWNER_ID:
-        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
-        return
-    
-    original_msg_id = int(callback_query.data.replace("broadcast_confirm_", ""))
-    
-    try:
-        # Получаем оригинальное сообщение
-        chat_id = callback_query.message.chat.id
-        original_message = None
-        
-        try:
-            original_message = await bot.get_message(chat_id, original_msg_id)
-        except:
-            # Пытаемся найти сообщение в истории
-            pass
-        
-        if not original_message:
-            await callback_query.answer("❌ Сообщение не найдено!", show_alert=True)
-            return
-        
-        broadcast_text = original_message.text
-        if "\n\n" in broadcast_text:
-            broadcast_text = broadcast_text.split("\n\n", 1)[1]
-        
-        await callback_query.message.edit_text("📢 *Рассылка началась...*", parse_mode="Markdown")
-        
-        all_users = db.get_all_users()
-        total_users = len(all_users)
-        sent_count = 0
-        failed_count = 0
-        
-        for user_id in all_users.keys():
-            try:
-                await bot.send_message(
-                    chat_id=user_id,
-                    text=f"📢 *Сообщение от администратора:*\n\n{broadcast_text}",
-                    parse_mode="Markdown"
-                )
-                sent_count += 1
-                
-                if sent_count % 10 == 0:
-                    await asyncio.sleep(1)
-                    
-            except Exception as e:
-                failed_count += 1
-        
-        await callback_query.message.answer(
-            f"✅ *Рассылка завершена!*\n\n"
-            f"👥 *Всего пользователей:* {total_users}\n"
-            f"✅ *Успешно отправлено:* {sent_count}\n"
-            f"❌ *Не отправлено:* {failed_count}",
-            parse_mode="Markdown"
-        )
-        
-    except Exception as e:
-        await callback_query.message.answer(f"❌ Ошибка рассылки: {e}")
-    
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data == "event_start")
-async def event_start_callback(callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    chat_id = callback_query.message.chat.id
-    
-    if user_id != OWNER_ID and not db.get_channel_check(user_id):
-        await callback_query.answer("❌ Сначала подпишитесь!", show_alert=True)
-        return
-    
-    if not await is_chat_admin(user_id, chat_id):
-        await callback_query.answer("❌ Только админы чата!", show_alert=True)
-        return
-    
-    if not db.check_gold(user_id):
-        await callback_query.answer("❌ Нужна GOLD подписка!", show_alert=True)
-        return
-    
-    global active_event
-    if active_event:
-        await callback_query.answer("❌ Уже есть активный эвент!", show_alert=True)
-        return
-    
-    event_types = [
-        ("🎯 Обычный", 100, 300, "Обычный эвент", 1.0),
-        ("🚀 Средний", 300, 600, "Средний эвент", 1.0),
-        ("💎 Мега", 600, 1000, "Мега эвент с бонусом удачи!", 1.2)
-    ]
-    etype, emin, emax, edesc, bonus_value = random.choice(event_types)
-    reward = random.randint(emin, emax)
-    event_id = random.randint(1000, 9999)
-    end_time = datetime.now() + timedelta(hours=1)
-    
-    active_event = {
-        'id': event_id,
-        'type': etype,
-        'reward': reward,
-        'end_time': end_time,
-        'chat_id': chat_id,
-        'creator': user_id,
-        'description': edesc,
-        'bonus_value': bonus_value
-    }
-    event_participants[event_id] = []
-    
-    text = (
-        f"🎪 *Новый эвент!*\n\n"
-        f"🎯 *{etype}*\n"
-        f"💰 *{reward} ¢*\n"
-        f"⏳ *1 час*\n"
-        f"📝 *{edesc}*\n"
-        f"🆔 *{event_id}*\n\n"
-        f"*Присоединиться:* нажмите кнопку ниже"
-    )
-    
-    keyboard = InlineKeyboardBuilder()
-    keyboard.row(InlineKeyboardButton(text="🎪 ПРИСОЕДИНИТЬСЯ", callback_data=f"join_event_{event_id}"))
-    keyboard.row(InlineKeyboardButton(text="📊 Профиль", callback_data="profile"))
-    
-    await callback_query.message.edit_text(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
-    event_participants[event_id].append(user_id)
-    await callback_query.answer("✅ Эвент запущен!")
-
-@dp.callback_query(lambda c: c.data.startswith("join_event_"))
-async def join_event_callback(callback_query: CallbackQuery):
-    global active_event
-    
-    if not active_event:
-        await callback_query.answer("❌ Нет активных эвентов!", show_alert=True)
-        return
-    
-    event_id = int(callback_query.data.replace("join_event_", ""))
-    if event_id != active_event['id']:
-        await callback_query.answer("❌ Эвент уже завершен!", show_alert=True)
-        return
-    
-    user_id = callback_query.from_user.id
-    
-    if active_event['creator'] != OWNER_ID and active_event.get('chat_id') != callback_query.message.chat.id:
-        await callback_query.answer("❌ Этот эвент в другом чате!", show_alert=True)
-        return
-    
-    if user_id in event_participants.get(active_event['id'], []):
-        await callback_query.answer("✅ Вы уже участвуете!", show_alert=True)
-        return
-    
-    event_participants[active_event['id']].append(user_id)
-    parts = len(event_participants[active_event['id']])
-    time_left = format_time(active_event['end_time'])
-    
-    # Если это эвент с бонусом, даём бонус удачи до конца эвента
-    bonus_value = active_event.get('bonus_value', 1.0)
-    if bonus_value > 1.0:
-        db.set_event_bonus(user_id, active_event['id'], bonus_value, active_event['end_time'])
-        bonus_percent = (bonus_value - 1) * 100
-        bonus_text = f"\n✨ *Вы получили бонус: +{bonus_percent:.0f}% к удаче до конца эвента!*"
-    else:
-        bonus_text = ""
-    
-    await callback_query.answer(f"🎉 Вы присоединились к эвенту! {parts} участников", show_alert=True)
-    
-    text = (
-        f"🎪 *Эвент*\n\n"
-        f"🎯 *{active_event['type']}*\n"
-        f"💰 *{active_event['reward']} ¢*\n"
-        f"👥 *{parts} участников*\n"
-        f"⏳ *{time_left}*"
-        f"{bonus_text}\n\n"
-        f"🆔 *ID:* {active_event['id']}"
-    )
-    
-    keyboard = InlineKeyboardBuilder()
-    keyboard.row(InlineKeyboardButton(text="🎪 ПРИСОЕДИНИТЬСЯ", callback_data=f"join_event_{active_event['id']}"))
-    keyboard.row(InlineKeyboardButton(text="📊 Профиль", callback_data="profile"))
-    
-    await callback_query.message.edit_text(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
-
-# =================== ЗАДАЧИ ФОНОВОЙ ОБРАБОТКИ ===================
+# =================== ФОНОВЫЕ ЗАДАЧИ ===================
 async def check_events_task():
-    """Автоматическое завершение эвентов"""
+    """Завершение эвентов"""
     while True:
         global active_event
         if active_event and datetime.now() >= active_event['end_time']:
@@ -2439,41 +832,16 @@ async def check_events_task():
                 reward = active_event['reward']
                 for uid in parts:
                     db.update_balance(uid, reward)
+                    db.get_user_data(uid)['event_bonus'] = None  # Удаляем бонус
                 
-                # Удаляем бонус удачи у всех участников
-                for uid in parts:
-                    db.remove_event_bonus(uid)
-                
-                # Если это МЕГА эвент, отправляем отдельное сообщение
-                bonus_value = active_event.get('bonus_value', 1.0)
-                if bonus_value > 1.0:
-                    bonus_percent = (bonus_value - 1) * 100
-                    try:
-                        await bot.send_message(
-                            active_event['chat_id'],
-                            f"🎉 *МЕГА эвент завершен!*\n\n"
-                            f"🎯 *{active_event['type']}*\n"
-                            f"💰 *{reward} ¢ каждому*\n"
-                            f"👥 *{len(parts)} участников*\n\n"
-                            f"✨ *Бонус удачи (+{bonus_percent:.0f}%) был активен до конца эвента и теперь снят.*\n\n"
-                            f"Поздравляем! 🎊",
-                            parse_mode="Markdown"
-                        )
-                    except:
-                        pass
-                else:
-                    try:
-                        await bot.send_message(
-                            active_event['chat_id'],
-                            f"🎉 *Эвент завершен!*\n\n"
-                            f"🎯 *{active_event['type']}*\n"
-                            f"💰 *{reward} ¢ каждому*\n"
-                            f"👥 *{len(parts)} участников*\n\n"
-                            f"Поздравляем! 🎊",
-                            parse_mode="Markdown"
-                        )
-                    except:
-                        pass
+                try:
+                    await bot.send_message(
+                        active_event['chat_id'],
+                        f"🎉 *Эвент завершен!*\n\n💰 {reward} ¢ каждому\n👥 {len(parts)} участников",
+                        parse_mode="Markdown"
+                    )
+                except:
+                    pass
             
             active_event = None
             if eid in event_participants:
@@ -2481,69 +849,23 @@ async def check_events_task():
         
         await asyncio.sleep(60)
 
-async def cleanup_temp_luck_task():
-    """Очистка истекшей временной удачи"""
-    while True:
-        try:
-            users = db.get_all_users()
-            cleaned_count = 0
-            
-            for user_id, data in users.items():
-                temp_end = data.get('temp_luck_end')
-                if temp_end:
-                    end_time = datetime.fromisoformat(temp_end)
-                    if datetime.now() >= end_time:
-                        db.remove_temp_luck(user_id)
-                        cleaned_count += 1
-            
-            if cleaned_count > 0:
-                print(f"🧹 Очищена временная удача у {cleaned_count} пользователей")
-                
-        except Exception as e:
-            print(f"⚠️ Ошибка очистки временной удачи: {e}")
-        
-        await asyncio.sleep(300)
-
-async def cleanup_event_bonus_task():
-    """Очистка истекших бонусов от эвентов"""
-    while True:
-        try:
-            users = db.get_all_users()
-            cleaned_count = 0
-            
-            for user_id, data in users.items():
-                event_bonus = data.get('event_bonus')
-                if event_bonus and event_bonus.get('end_time'):
-                    end_time = datetime.fromisoformat(event_bonus['end_time'])
-                    if datetime.now() >= end_time:
-                        db.remove_event_bonus(user_id)
-                        cleaned_count += 1
-            
-            if cleaned_count > 0:
-                print(f"🧹 Снят бонус от эвента у {cleaned_count} пользователей")
-                
-        except Exception as e:
-            print(f"⚠️ Ошибка очистки бонусов эвента: {e}")
-        
-        await asyncio.sleep(600)
-
 # =================== ЗАПУСК ===================
 async def main():
     print("=" * 50)
-    print("🤖 Farm Bot запускается...")
+    print("🚀 Farm Bot запускается...")
     print(f"👑 Владелец: {OWNER_ID}")
     print(f"📢 Канал: @{CHANNEL_USERNAME}")
     print("=" * 50)
     
-    # Запускаем фоновые задачи
+    # Фоновая задача
     asyncio.create_task(check_events_task())
-    asyncio.create_task(cleanup_temp_luck_task())
-    asyncio.create_task(cleanup_event_bonus_task())
     
     try:
+        bot_info = await bot.get_me()
+        print(f"✅ Бот: @{bot_info.username}")
+        print("🔄 Ожидание сообщений...")
+        
         await dp.start_polling(bot)
-    except KeyboardInterrupt:
-        print("\n🛑 Бот остановлен")
     except Exception as e:
         print(f"❌ Ошибка: {e}")
 
