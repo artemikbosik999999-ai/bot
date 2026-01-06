@@ -1,3 +1,65 @@
+# =================== ОСНОВНЫЕ КОМАНДЫ ===================
+@dp.message(Command("start"))
+async def start_cmd(message: Message):
+    user_id = message.from_user.id
+    
+    if db.get_user_data(user_id).get('is_banned'):
+        await message.answer("⛔ Вы забанены!")
+        return
+    
+    # Проверяем, что это не личные сообщения
+    if message.chat.type == ChatType.PRIVATE:
+        # В личных сообщениях показываем приветствие с кнопкой добавления в группу
+        text = (
+            "🤖 *Привет! Я Фермер Бот!*\n\n"
+            "📢 *Для начала работы:*\n"
+            "1️⃣ Подпишись на канал разработчика\n"
+            "2️⃣ Добавь меня в группу\n"
+            "3️⃣ Становись богачом! 💰\n\n"
+            "🚀 *Бот работает только в группах и чатах!*"
+        )
+        
+        keyboard = InlineKeyboardBuilder()
+        keyboard.row(InlineKeyboardButton(text="📢 ПОДПИСАТЬСЯ НА КАНАЛ", url=f"https://t.me/{CHANNEL_USERNAME}"))
+        keyboard.row(InlineKeyboardButton(text="➕ ДОБАВИТЬ БОТА В ГРУППУ", url="https://t.me/farmirobot?startgroup=true"))
+        
+        await message.answer(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
+        return
+    
+    # В группах проверяем подписку
+    if user_id != OWNER_ID and not db.get_user_data(user_id).get('channel_check'):
+        await check_channel(message)
+        return
+    
+    user_data = db.get_user_data(user_id)
+    
+    # Главное меню с кнопками (СТАРЫЙ ФОРМАТ)
+    text = (
+        f"🎮 *Farm Bot*\n\n"
+        f"💰 *Баланс:* {user_data['balance']:.2f} ¢\n"
+        f"✨ *Сила:* {user_data['star_power']}\n"
+        f"⏳ *Урожайность:* {user_data['productivity']:.2f}\n\n"
+        f"🌵 *Фарм команды:*\n"
+        f"кактус ферма шахта сад охота\n"
+        f"(кулдаун 2 часа)"
+    )
+    
+    keyboard = InlineKeyboardBuilder()
+    keyboard.row(
+        InlineKeyboardButton(text="📊 Профиль", callback_data="profile"),
+        InlineKeyboardButton(text="🛒 Магазин", callback_data="shop")
+    )
+    keyboard.row(
+        InlineKeyboardButton(text="🎪 Эвенты", callback_data="events"),
+        InlineKeyboardButton(text="❓ Помощь", callback_data="help_menu")
+    )
+    
+    # Кнопка только для владельца
+    if user_id == OWNER_ID:
+        keyboard.row(InlineKeyboardButton(text="👑 Панель владельца", callback_data="owner_panel"))
+    
+    await message.answer(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
+
 # =================== ПАНЕЛЬ ВЛАДЕЛЬЦА ===================
 @dp.message(Command("owner"))
 async def owner_cmd(message: Message):
@@ -96,23 +158,6 @@ async def stats_cmd(message: Message):
     
     await message.answer(text, parse_mode="Markdown")
 
-@dp.callback_query(lambda c: c.data == "refresh_stats")
-async def refresh_stats_callback(callback_query: CallbackQuery):
-    """Обновить статистику"""
-    if callback_query.from_user.id != OWNER_ID:
-        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
-        return
-    
-    message = Message(
-        message_id=callback_query.message.message_id,
-        date=datetime.now(),
-        chat=callback_query.message.chat,
-        from_user=callback_query.from_user,
-        text=""
-    )
-    await stats_cmd(message)
-    await callback_query.answer("✅ Статистика обновлена!")
-
 @dp.message(Command("chats"))
 async def chats_cmd(message: Message):
     if message.from_user.id != OWNER_ID:
@@ -124,20 +169,6 @@ async def chats_cmd(message: Message):
     text += "ℹ️ Для просмотра всех чатов используйте команду в ЛС бота"
     
     await message.answer(text, parse_mode="Markdown")
-
-@dp.callback_query(lambda c: c.data == "all_chats_list")
-async def all_chats_list_callback(callback_query: CallbackQuery):
-    """Показать список всех чатов"""
-    if callback_query.from_user.id != OWNER_ID:
-        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
-        return
-    
-    # Простой ответ
-    text = "📋 *Список всех чатов*\n\n"
-    text += "ℹ️ Для просмотра всех чатов используйте команду /chats в ЛС бота"
-    
-    await callback_query.message.edit_text(text, parse_mode="Markdown")
-    await callback_query.answer()
 
 # =================== КОМАНДЫ ВЛАДЕЛЬЦА ===================
 @dp.message(Command("give"))
@@ -386,4 +417,32 @@ async def owner_panel_callback(callback_query: CallbackQuery):
     )
     
     await owner_cmd(message)
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data == "refresh_stats")
+async def refresh_stats_callback(callback_query: CallbackQuery):
+    if callback_query.from_user.id != OWNER_ID:
+        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
+        return
+    
+    message = Message(
+        message_id=callback_query.message.message_id,
+        date=datetime.now(),
+        chat=callback_query.message.chat,
+        from_user=callback_query.from_user,
+        text=""
+    )
+    await stats_cmd(message)
+    await callback_query.answer("✅ Статистика обновлена!")
+
+@dp.callback_query(lambda c: c.data == "all_chats_list")
+async def all_chats_list_callback(callback_query: CallbackQuery):
+    if callback_query.from_user.id != OWNER_ID:
+        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
+        return
+    
+    text = "📋 *Список всех чатов*\n\n"
+    text += "ℹ️ Для просмотра всех чатов используйте команду /chats в ЛС бота"
+    
+    await callback_query.message.edit_text(text, parse_mode="Markdown")
     await callback_query.answer()
