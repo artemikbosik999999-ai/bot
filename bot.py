@@ -4,10 +4,10 @@ import asyncio
 import random
 import redis
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message, InlineKeyboardButton, CallbackQuery
+from aiogram.types import Message, InlineKeyboardButton, CallbackQuery, Chat
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ChatMemberStatus, ChatType
 
@@ -70,6 +70,12 @@ class Database:
     def _get_key(self, user_id: int) -> str:
         return f"user:{user_id}"
     
+    def _get_chat_key(self, chat_id: int) -> str:
+        return f"chat:{chat_id}"
+    
+    def _get_stats_key(self) -> str:
+        return "bot_stats"
+    
     def get_user_data(self, user_id: int) -> Dict[str, Any]:
         if self.redis:
             data = self.redis.get(self._get_key(user_id))
@@ -82,6 +88,70 @@ class Database:
             self.redis.set(self._get_key(user_id), json.dumps(data))
         else:
             self.memory_db[user_id] = data
+    
+    def get_chat_data(self, chat_id: int) -> Dict[str, Any]:
+        if self.redis:
+            data = self.redis.get(self._get_chat_key(chat_id))
+            return json.loads(data) if data else self._default_chat_data()
+        else:
+            return self.memory_db.get(f"chat_{chat_id}", self._default_chat_data())
+    
+    def save_chat_data(self, chat_id: int, data: Dict[str, Any]):
+        if self.redis:
+            self.redis.set(self._get_chat_key(chat_id), json.dumps(data))
+        else:
+            self.memory_db[f"chat_{chat_id}"] = data
+    
+    def update_chat_stats(self, chat_id: int, chat_title: str = None, chat_type: str = None):
+        """Обновить статистику чата"""
+        chat_data = self.get_chat_data(chat_id)
+        
+        if chat_title:
+            chat_data['title'] = chat_title
+        if chat_type:
+            chat_data['type'] = chat_type
+        
+        chat_data['last_activity'] = datetime.now().isoformat()
+        chat_data['message_count'] = chat_data.get('message_count', 0) + 1
+        
+        self.save_chat_data(chat_id, chat_data)
+    
+    def get_all_chats(self) -> Dict[int, Dict[str, Any]]:
+        """Получить все чаты где был бот"""
+        if self.redis:
+            chats = {}
+            for key in self.redis.keys("chat:*"):
+                chat_id = int(key.split(":")[1])
+                chats[chat_id] = json.loads(self.redis.get(key))
+            return chats
+        else:
+            chats = {}
+            for key, value in self.memory_db.items():
+                if key.startswith("chat_"):
+                    chat_id = int(key.replace("chat_", ""))
+                    chats[chat_id] = value
+            return chats
+    
+    def get_bot_stats(self) -> Dict[str, Any]:
+        """Получить общую статистику бота"""
+        if self.redis:
+            data = self.redis.get(self._get_stats_key())
+            return json.loads(data) if data else self._default_bot_stats()
+        else:
+            return self.memory_db.get("bot_stats", self._default_bot_stats())
+    
+    def update_bot_stats(self, stats: Dict[str, Any]):
+        """Обновить статистику бота"""
+        if self.redis:
+            self.redis.set(self._get_stats_key(), json.dumps(stats))
+        else:
+            self.memory_db["bot_stats"] = stats
+    
+    def increment_stat(self, stat_name: str, amount: int = 1):
+        """Увеличить статистический показатель"""
+        stats = self.get_bot_stats()
+        stats[stat_name] = stats.get(stat_name, 0) + amount
+        self.update_bot_stats(stats)
     
     def _default_user_data(self):
         return {
@@ -99,7 +169,30 @@ class Database:
             'total_earned': 0,
             'is_banned': False,
             'channel_check': False,
-            'event_bonus': None,  # {event_id: bonus_value, end_time: isoformat}
+            'event_bonus': None,
+        }
+    
+    def _default_chat_data(self):
+        return {
+            'title': None,
+            'type': None,
+            'last_activity': datetime.now().isoformat(),
+            'message_count': 0,
+            'created_at': datetime.now().isoformat(),
+        }
+    
+    def _default_bot_stats(self):
+        return {
+            'total_users': 0,
+            'active_users': 0,
+            'total_messages': 0,
+            'total_farm_commands': 0,
+            'total_balance': 0,
+            'chats_count': 0,
+            'groups_count': 0,
+            'supergroups_count': 0,
+            'channels_count': 0,
+            'start_time': datetime.now().isoformat(),
         }
     
     def update_balance(self, user_id: int, amount: float):
@@ -107,12 +200,23 @@ class Database:
         data['balance'] = round(data['balance'] + amount, 2)
         if amount > 0:
             data['total_earned'] = round(data.get('total_earned', 0) + amount, 2)
+            # Обновляем общий баланс в статистике
+            stats = self.get_bot_stats()
+            stats['total_balance'] = stats.get('total_balance', 0) + amount
+            self.update_bot_stats(stats)
         self.save_user_data(user_id, data)
     
     def set_balance(self, user_id: int, amount: float):
         data = self.get_user_data(user_id)
+        old_balance = data.get('balance', 0)
         data['balance'] = round(amount, 2)
         self.save_user_data(user_id, data)
+        
+        # Обновляем общий баланс
+        stats = self.get_bot_stats()
+        current_total = stats.get('total_balance', 0)
+        stats['total_balance'] = current_total - old_balance + amount
+        self.update_bot_stats(stats)
     
     def set_cooldown(self, user_id: int, command: str, hours: int = 2):
         data = self.get_user_data(user_id)
@@ -411,6 +515,104 @@ def get_sub_status(user_data: dict) -> str:
             days = (end - datetime.now()).days
             return f"✨ GOLD ({days} дней)"
     return "⭕ Подписка истекла"
+
+def format_number(num: float) -> str:
+    """Форматирование чисел с разделителями"""
+    return f"{num:,.2f}".replace(",", " ").replace(".", ",")
+
+def create_owner_panel_frame(title: str, content_lines: List[str]) -> str:
+    """Создает красивую рамку для панели владельца"""
+    # Находим максимальную длину строки
+    max_length = max(len(line) for line in content_lines) if content_lines else 0
+    width = max(max_length, 40)  # Минимальная ширина 40 символов
+    
+    # Верхняя граница
+    top_border = "╔" + "═" * (width + 2) + "╗\n"
+    
+    # Заголовок
+    title_line = f"║ 👑 {title.center(width)} ║\n"
+    separator = "╠" + "═" * (width + 2) + "╣\n"
+    
+    # Содержимое
+    content = ""
+    for line in content_lines:
+        content += f"║ {line.ljust(width)} ║\n"
+    
+    # Нижняя граница
+    bottom_border = "╚" + "═" * (width + 2) + "╝"
+    
+    return top_border + title_line + separator + content + bottom_border
+
+def create_stats_frame(title: str, stats_lines: List[str]) -> str:
+    """Создает красивую рамку для статистики"""
+    # Находим максимальную длину строки
+    max_length = max(len(line) for line in stats_lines) if stats_lines else 0
+    width = max(max_length, 40)
+    
+    # Верхняя граница
+    top_border = "╔" + "═" * (width + 2) + "╗\n"
+    
+    # Заголовок
+    title_line = f"║ 📊 {title.center(width)} ║\n"
+    separator = "╠" + "═" * (width + 2) + "╣\n"
+    
+    # Содержимое
+    content = ""
+    for line in stats_lines:
+        content += f"║ {line.ljust(width)} ║\n"
+    
+    # Нижняя граница
+    bottom_border = "╚" + "═" * (width + 2) + "╝"
+    
+    return top_border + title_line + separator + content + bottom_border
+
+# =================== ОБРАБОТКА ВСЕХ СООБЩЕНИЙ ===================
+@dp.message()
+async def track_all_messages(message: Message):
+    """Отслеживание всех сообщений для статистики"""
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    
+    # Увеличиваем счетчик сообщений
+    db.increment_stat('total_messages')
+    
+    # Если это не ЛС, обновляем статистику чата
+    if message.chat.type != ChatType.PRIVATE:
+        chat_title = message.chat.title
+        chat_type = message.chat.type
+        
+        # Обновляем данные чата
+        db.update_chat_stats(chat_id, chat_title, chat_type)
+        
+        # Обновляем счетчики типов чатов
+        stats = db.get_bot_stats()
+        if chat_type == 'group':
+            stats['groups_count'] = stats.get('groups_count', 0) + 1
+        elif chat_type == 'supergroup':
+            stats['supergroups_count'] = stats.get('supergroups_count', 0) + 1
+        elif chat_type == 'channel':
+            stats['channels_count'] = stats.get('channels_count', 0) + 1
+        
+        # Общее количество чатов
+        all_chats = db.get_all_chats()
+        stats['chats_count'] = len(all_chats)
+        
+        db.update_bot_stats(stats)
+    
+    # Обновляем статистику пользователей
+    stats = db.get_bot_stats()
+    all_users = db.get_all_users()
+    stats['total_users'] = len(all_users)
+    
+    # Считаем активных пользователей (были активны в последние 7 дней)
+    active_count = 0
+    for user_data in all_users.values():
+        # Проверяем активность (упрощенная версия)
+        if user_data.get('balance', 0) > 0:
+            active_count += 1
+    stats['active_users'] = active_count
+    
+    db.update_bot_stats(stats)
 
 # =================== ПРОВЕРКА ПОДПИСКИ НА КАНАЛ ===================
 @dp.message(Command("check"))
@@ -758,13 +960,268 @@ async def help_cmd(message: Message):
     
     await message.answer(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
 
-# =================== ПАНЕЛЬ ВЛАДЕЛЬЦА ===================
+# =================== СТАТИСТИКА БОТА ===================
+@dp.message(Command("stats"))
+async def stats_cmd(message: Message):
+    """Статистика бота - доступна только владельцу"""
+    if message.from_user.id != OWNER_ID:
+        await message.answer("⛔ Нет доступа!")
+        return
+    
+    stats = db.get_bot_stats()
+    all_chats = db.get_all_chats()
+    all_users = db.get_all_users()
+    
+    # Считаем активные чаты (активны в последние 7 дней)
+    active_chats = 0
+    week_ago = datetime.now() - timedelta(days=7)
+    
+    for chat_data in all_chats.values():
+        last_activity = datetime.fromisoformat(chat_data.get('last_activity', datetime.now().isoformat()))
+        if last_activity > week_ago:
+            active_chats += 1
+    
+    # Считаем общий баланс всех пользователей
+    total_balance = sum(user.get('balance', 0) for user in all_users.values())
+    total_earned = sum(user.get('total_earned', 0) for user in all_users.values())
+    
+    # Считаем пользователей с подписками
+    gold_users = sum(1 for user in all_users.values() if user.get('subscription') == 'gold')
+    
+    # Форматируем время работы бота
+    start_time = datetime.fromisoformat(stats.get('start_time', datetime.now().isoformat()))
+    uptime = datetime.now() - start_time
+    
+    if uptime.days > 0:
+        uptime_str = f"{uptime.days} дней, {uptime.seconds//3600} часов"
+    else:
+        uptime_str = f"{uptime.seconds//3600} часов, {(uptime.seconds%3600)//60} минут"
+    
+    # Создаем строки для рамки
+    stats_lines = [
+        "👥 *Пользователи:*",
+        f"• Всего: {stats.get('total_users', 0)}",
+        f"• Активных: {stats.get('active_users', 0)}",
+        f"• С GOLD: {gold_users}",
+        "",
+        "💬 *Чаты:*",
+        f"• Всего: {stats.get('chats_count', 0)}",
+        f"• Активных: {active_chats}",
+        f"• Группы: {stats.get('groups_count', 0)}",
+        f"• Супергруппы: {stats.get('supergroups_count', 0)}",
+        f"• Каналы: {stats.get('channels_count', 0)}",
+        "",
+        "💰 *Экономика:*",
+        f"• Общий баланс: {format_number(total_balance)} ¢",
+        f"• Всего заработано: {format_number(total_earned)} ¢",
+        f"• Средний баланс: {format_number(total_balance / max(1, stats.get('total_users', 1)))} ¢",
+        "",
+        "📈 *Активность:*",
+        f"• Сообщений: {stats.get('total_messages', 0)}",
+        f"• Фарм-команд: {stats.get('total_farm_commands', 0)}",
+        f"• Время работы: {uptime_str}"
+    ]
+    
+    # Создаем красивую рамку
+    text = create_stats_frame("СТАТИСТИКА БОТА", stats_lines)
+    
+    # Добавляем информацию о последних чатах
+    text += "\n\n🔄 *Последние 5 активных чатов:*\n"
+    
+    # Сортируем чаты по последней активности
+    sorted_chats = sorted(all_chats.items(), 
+                         key=lambda x: datetime.fromisoformat(x[1].get('last_activity', '2000-01-01')), 
+                         reverse=True)
+    
+    for i, (chat_id, chat_data) in enumerate(sorted_chats[:5]):
+        chat_title = chat_data.get('title', f"Чат {chat_id}")
+        chat_type = chat_data.get('type', 'unknown')
+        last_active = datetime.fromisoformat(chat_data.get('last_activity', datetime.now().isoformat()))
+        time_ago = datetime.now() - last_active
+        
+        if time_ago.days > 0:
+            ago_str = f"{time_ago.days}д назад"
+        elif time_ago.seconds >= 3600:
+            ago_str = f"{time_ago.seconds//3600}ч назад"
+        else:
+            ago_str = f"{time_ago.seconds//60}м назад"
+        
+        type_emoji = {
+            'group': '👥',
+            'supergroup': '👥',
+            'channel': '📢',
+            'private': '👤'
+        }.get(chat_type, '❓')
+        
+        text += f"{i+1}. {type_emoji} {chat_title[:20]} - {ago_str}\n"
+    
+    if len(sorted_chats) > 5:
+        text += f"\n...и еще {len(sorted_chats) - 5} чатов"
+    
+    keyboard = InlineKeyboardBuilder()
+    keyboard.row(
+        InlineKeyboardButton(text="📋 Список всех чатов", callback_data="all_chats_list"),
+        InlineKeyboardButton(text="🔄 Обновить статистику", callback_data="refresh_stats")
+    )
+    keyboard.row(InlineKeyboardButton(text="👑 Панель владельца", callback_data="owner_panel"))
+    
+    await message.answer(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
+
+@dp.callback_query(lambda c: c.data == "refresh_stats")
+async def refresh_stats_callback(callback_query: CallbackQuery):
+    """Обновить статистику"""
+    if callback_query.from_user.id != OWNER_ID:
+        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
+        return
+    
+    await stats_cmd(callback_query.message)
+    await callback_query.answer("✅ Статистика обновлена!")
+
+@dp.callback_query(lambda c: c.data == "all_chats_list")
+async def all_chats_list_callback(callback_query: CallbackQuery):
+    """Показать список всех чатов"""
+    if callback_query.from_user.id != OWNER_ID:
+        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
+        return
+    
+    all_chats = db.get_all_chats()
+    
+    if not all_chats:
+        await callback_query.message.answer("📭 Бот еще не добавлен ни в один чат.")
+        await callback_query.answer()
+        return
+    
+    # Сортируем чаты по последней активности
+    sorted_chats = sorted(all_chats.items(), 
+                         key=lambda x: datetime.fromisoformat(x[1].get('last_activity', '2000-01-01')), 
+                         reverse=True)
+    
+    text = "📋 *СПИСОК ВСЕХ ЧАТОВ*\n\n"
+    
+    for i, (chat_id, chat_data) in enumerate(sorted_chats[:20]):  # Показываем первые 20
+        chat_title = chat_data.get('title', f"Чат {chat_id}")
+        chat_type = chat_data.get('type', 'unknown')
+        last_active = datetime.fromisoformat(chat_data.get('last_activity', datetime.now().isoformat()))
+        message_count = chat_data.get('message_count', 0)
+        
+        time_ago = datetime.now() - last_active
+        if time_ago.days > 0:
+            ago_str = f"{time_ago.days}д"
+        elif time_ago.seconds >= 3600:
+            ago_str = f"{time_ago.seconds//3600}ч"
+        else:
+            ago_str = f"{time_ago.seconds//60}м"
+        
+        type_emoji = {
+            'group': '👥',
+            'supergroup': '👥',
+            'channel': '📢',
+            'private': '👤'
+        }.get(chat_type, '❓')
+        
+        text += f"*{i+1}. {type_emoji} {chat_title[:30]}*\n"
+        text += f"   🆔: `{chat_id}` | 📝: {message_count} | 🕐: {ago_str} назад\n\n"
+    
+    if len(sorted_chats) > 20:
+        text += f"\n...и еще {len(sorted_chats) - 20} чатов"
+    
+    keyboard = InlineKeyboardBuilder()
+    keyboard.row(
+        InlineKeyboardButton(text="📊 Общая статистика", callback_data="refresh_stats"),
+        InlineKeyboardButton(text="👑 Панель владельца", callback_data="owner_panel")
+    )
+    
+    await callback_query.message.edit_text(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
+    await callback_query.answer()
+
+# =================== ПАНЕЛЬ ВЛАДЕЛЬЦА С КРАСИВОЙ РАМКОЙ ===================
 @dp.message(Command("owner"))
 async def owner_cmd(message: Message):
     if message.from_user.id != OWNER_ID:
         await message.answer("⛔ Нет доступа!")
         return
     
+    # Проверяем, где отправлена команда
+    if message.chat.type == ChatType.PRIVATE:
+        # В ЛС показываем красивую панель с рамкой
+        await show_owner_panel_private(message)
+    else:
+        # В группах показываем упрощенную панель
+        await show_owner_panel_group(message)
+
+async def show_owner_panel_private(message: Message):
+    """Красивая панель владельца в личных сообщениях с рамкой"""
+    
+    # Создаем строки для рамки
+    content_lines = [
+        "╔════════════════════════════════════════╗",
+        "║                                        ║",
+        "║         👑 ПАНЕЛЬ ВЛАДЕЛЬЦА 👑         ║",
+        "║                                        ║",
+        "╠════════════════════════════════════════╣",
+        "║                                        ║",
+        "║   📊 *Статистика и мониторинг:*        ║",
+        "║   /stats - статистика бота             ║",
+        "║   /chats - список всех чатов           ║",
+        "║                                        ║",
+        "║   💰 *Управление балансами:*           ║",
+        "║   /give <id> <сумма> - выдать деньги   ║",
+        "║   /set <id> <сумма> - установить баланс║",
+        "║                                        ║",
+        "║   🎖️ *Управление подписками:*          ║",
+        "║   /gold <id> <дни> - выдать GOLD       ║",
+        "║   /gold_forever <id> - вечная GOLD     ║",
+        "║   /remove_gold <id> - удалить подписку ║",
+        "║                                        ║",
+        "║   🍀 *Управление удачей:*              ║",
+        "║   /luck <id> <значение> - удача        ║",
+        "║   /temp_luck <id> <зн> <мин> - врем.   ║",
+        "║   /luck_all <значение> - удача всем    ║",
+        "║   /luck_reset_all - сбросить всем      ║",
+        "║                                        ║",
+        "║   ⚙️ *Администрация:*                  ║",
+        "║   /ban <id> - забанить                 ║",
+        "║   /unban <id> - разбанить              ║",
+        "║   /resetcd <id> - сбросить кулдауны    ║",
+        "║                                        ║",
+        "║   📢 *Рассылка:*                       ║",
+        "║   /broadcast <текст> - отправить всем  ║",
+        "║                                        ║",
+        "║   🎪 *Эвенты:*                         ║",
+        "║   /owner_event - запустить эвент       ║",
+        "║   /stop_event - остановить эвент       ║",
+        "║                                        ║",
+        "╚════════════════════════════════════════╝"
+    ]
+    
+    text = "\n".join(content_lines)
+    
+    keyboard = InlineKeyboardBuilder()
+    keyboard.row(
+        InlineKeyboardButton(text="📊 Статистика", callback_data="refresh_stats"),
+        InlineKeyboardButton(text="📋 Список чатов", callback_data="all_chats_list")
+    )
+    keyboard.row(
+        InlineKeyboardButton(text="💰 Выдать деньги", callback_data="owner_give_prompt"),
+        InlineKeyboardButton(text="🎖️ Выдать GOLD", callback_data="owner_gold_prompt")
+    )
+    keyboard.row(
+        InlineKeyboardButton(text="🍀 Управление удачей", callback_data="owner_luck_menu"),
+        InlineKeyboardButton(text="📢 Рассылка", callback_data="owner_broadcast_prompt")
+    )
+    keyboard.row(
+        InlineKeyboardButton(text="⛔ Забанить", callback_data="owner_ban_prompt"),
+        InlineKeyboardButton(text="✅ Разбанить", callback_data="owner_unban_prompt")
+    )
+    keyboard.row(
+        InlineKeyboardButton(text="🎪 Запустить эвент", callback_data="owner_event_prompt"),
+        InlineKeyboardButton(text="🔄 Сбросить кд", callback_data="owner_resetcd_prompt")
+    )
+    
+    await message.answer(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
+
+async def show_owner_panel_group(message: Message):
+    """Панель владельца в группах"""
     text = (
         "👑 *Панель владельца*\n\n"
         "💰 *Управление балансами:*\n"
@@ -792,24 +1249,30 @@ async def owner_cmd(message: Message):
     
     keyboard = InlineKeyboardBuilder()
     keyboard.row(
-        InlineKeyboardButton(text="💰 Выдать деньги", callback_data="owner_give"),
-        InlineKeyboardButton(text="🎖️ Выдать GOLD", callback_data="owner_gold")
+        InlineKeyboardButton(text="📊 Статистика", callback_data="refresh_stats"),
+        InlineKeyboardButton(text="🍀 Управление удачей", callback_data="owner_luck_menu")
     )
     keyboard.row(
-        InlineKeyboardButton(text="🍀 Управление удачей", callback_data="owner_luck_menu"),
-        InlineKeyboardButton(text="📢 Рассылка", callback_data="owner_broadcast")
-    )
-    keyboard.row(
-        InlineKeyboardButton(text="⛔ Забанить", callback_data="owner_ban"),
-        InlineKeyboardButton(text="✅ Разбанить", callback_data="owner_unban")
-    )
-    keyboard.row(
-        InlineKeyboardButton(text="🎪 Эвент", callback_data="owner_event"),
-        InlineKeyboardButton(text="🔄 Сбросить кд", callback_data="owner_resetcd")
+        InlineKeyboardButton(text="💰 Выдать деньги", callback_data="owner_give_prompt"),
+        InlineKeyboardButton(text="📢 Рассылка", callback_data="owner_broadcast_prompt")
     )
     keyboard.row(InlineKeyboardButton(text="🔙 Назад", callback_data="profile"))
     
     await message.answer(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
+
+@dp.message(Command("chats"))
+async def chats_cmd(message: Message):
+    """Команда для просмотра списка чатов"""
+    if message.from_user.id != OWNER_ID:
+        await message.answer("⛔ Нет доступа!")
+        return
+    
+    await all_chats_list_callback(CallbackQuery(
+        message=message,
+        from_user=message.from_user,
+        chat_instance="",
+        data="all_chats_list"
+    ))
 
 @dp.message(Command("give"))
 async def give_money(message: Message, command: CommandObject):
@@ -1041,9 +1504,9 @@ async def event_start_cmd(message: Message):
         return
     
     event_types = [
-        ("🎯 Обычный", 100, 300, "Обычный эвент", 1.0),  # Без бонуса
-        ("🚀 Средний", 300, 600, "Средний эвент", 1.0), # Без бонуса
-        ("💎 Мега", 600, 1000, "Мега эвент с бонусом удачи!", 1.2)  # +20% бонус
+        ("🎯 Обычный", 100, 300, "Обычный эвент", 1.0),
+        ("🚀 Средний", 300, 600, "Средний эвент", 1.0),
+        ("💎 Мега", 600, 1000, "Мега эвент с бонусом удачи!", 1.2)
     ]
     etype, emin, emax, edesc, bonus_value = random.choice(event_types)
     reward = random.randint(emin, emax)
@@ -1213,6 +1676,9 @@ async def farm_command(message: Message):
         await message.reply(f"⏳ {cmd} на кулдауне!\n\nВозвращайтесь через {format_time(cd)}")
         return
     
+    # Увеличиваем счетчик фарм-команд
+    db.increment_stat('total_farm_commands')
+    
     user_data = db.get_user_data(user_id)
     cmd_info = FARM_COMMANDS[cmd]
     
@@ -1347,6 +1813,9 @@ async def farm_button_callback(callback_query: CallbackQuery):
     if cd:
         await callback_query.answer(f"⏳ {cmd_name} на кулдауне! {format_time(cd)}", show_alert=True)
         return
+    
+    # Увеличиваем счетчик фарм-команд
+    db.increment_stat('total_farm_commands')
     
     user_data = db.get_user_data(user_id)
     cmd_info = FARM_COMMANDS[cmd_name]
@@ -1540,6 +2009,128 @@ async def owner_temp_luck_prompt_callback(callback_query: CallbackQuery):
         "/temp_luck 123456789 5.0 5 - удача 5x на 5 минут\n"
         "/temp_luck 123456789 100.0 60 - удача 100x на 1 час\n\n"
         "📊 *Эффект:* Временная удача заменяет постоянную на указанное время.",
+        parse_mode="Markdown"
+    )
+    await callback_query.answer()
+
+# =================== ПРОМПТЫ ДЛЯ УПРАВЛЕНИЯ В ЛС ===================
+@dp.callback_query(lambda c: c.data == "owner_give_prompt")
+async def owner_give_prompt_callback(callback_query: CallbackQuery):
+    if callback_query.from_user.id != OWNER_ID:
+        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
+        return
+    
+    await callback_query.message.answer(
+        "💰 *Выдать деньги пользователю*\n\n"
+        "Введите команду:\n"
+        "/give <id> <сумма>\n\n"
+        "📊 *Пример:*\n"
+        "/give 123456789 1000\n\n"
+        "📝 *Примечание:* Можно использовать в ЛС для управления ботом",
+        parse_mode="Markdown"
+    )
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data == "owner_gold_prompt")
+async def owner_gold_prompt_callback(callback_query: CallbackQuery):
+    if callback_query.from_user.id != OWNER_ID:
+        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
+        return
+    
+    await callback_query.message.answer(
+        "🎖️ *Выдать GOLD подписку*\n\n"
+        "Введите команду:\n"
+        "/gold <id> [дни]\n\n"
+        "📊 *Примеры:*\n"
+        "/gold 123456789 30 - GOLD на 30 дней\n"
+        "/gold_forever 123456789 - вечная GOLD\n"
+        "/remove_gold 123456789 - удалить подписку\n\n"
+        "📝 *Примечание:* По умолчанию 30 дней",
+        parse_mode="Markdown"
+    )
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data == "owner_broadcast_prompt")
+async def owner_broadcast_prompt_callback(callback_query: CallbackQuery):
+    if callback_query.from_user.id != OWNER_ID:
+        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
+        return
+    
+    await callback_query.message.answer(
+        "📢 *Рассылка сообщений*\n\n"
+        "Введите команду:\n"
+        "/broadcast <текст сообщения>\n\n"
+        "📊 *Пример:*\n"
+        "/broadcast Важное обновление! Добавлены новые функции.\n\n"
+        "⚠️ *Внимание:* Сообщение будет отправлено всем пользователям бота",
+        parse_mode="Markdown"
+    )
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data == "owner_ban_prompt")
+async def owner_ban_prompt_callback(callback_query: CallbackQuery):
+    if callback_query.from_user.id != OWNER_ID:
+        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
+        return
+    
+    await callback_query.message.answer(
+        "⛔ *Забанить пользователя*\n\n"
+        "Введите команду:\n"
+        "/ban <id>\n\n"
+        "📊 *Пример:*\n"
+        "/ban 123456789\n\n"
+        "📝 *Для разбанивания:* /unban <id>",
+        parse_mode="Markdown"
+    )
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data == "owner_unban_prompt")
+async def owner_unban_prompt_callback(callback_query: CallbackQuery):
+    if callback_query.from_user.id != OWNER_ID:
+        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
+        return
+    
+    await callback_query.message.answer(
+        "✅ *Разбанить пользователя*\n\n"
+        "Введите команду:\n"
+        "/unban <id>\n\n"
+        "📊 *Пример:*\n"
+        "/unban 123456789\n\n"
+        "📝 *Для бана:* /ban <id>",
+        parse_mode="Markdown"
+    )
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data == "owner_event_prompt")
+async def owner_event_prompt_callback(callback_query: CallbackQuery):
+    if callback_query.from_user.id != OWNER_ID:
+        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
+        return
+    
+    await callback_query.message.answer(
+        "🎪 *Запустить эвент*\n\n"
+        "Введите команду:\n"
+        "/owner_event\n\n"
+        "📊 *Для остановки эвента:*\n"
+        "/stop_event\n\n"
+        "⚠️ *Внимание:* Эвент запустится в текущем чате",
+        parse_mode="Markdown"
+    )
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data == "owner_resetcd_prompt")
+async def owner_resetcd_prompt_callback(callback_query: CallbackQuery):
+    if callback_query.from_user.id != OWNER_ID:
+        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
+        return
+    
+    await callback_query.message.answer(
+        "🔄 *Сбросить кулдауны пользователю*\n\n"
+        "Введите команду:\n"
+        "/resetcd <id>\n\n"
+        "📊 *Пример:*\n"
+        "/resetcd 123456789\n\n"
+        "📝 *Примечание:* Сбрасывает все кулдауны фарм-команд",
         parse_mode="Markdown"
     )
     await callback_query.answer()
