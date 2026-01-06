@@ -7,9 +7,11 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message, InlineKeyboardButton, CallbackQuery, Chat
+from aiogram.types import Message, InlineKeyboardButton, CallbackQuery, Chat, ChatMemberUpdated
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ChatMemberStatus, ChatType
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
 
 # =================== КОНСТАНТЫ ===================
 # Безопасная загрузка из настроек Bothost
@@ -457,7 +459,8 @@ class Database:
 # =================== ИНИЦИАЛИЗАЦИЯ ===================
 db = Database()
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
 active_event = None
 event_participants = {}
 
@@ -519,52 +522,6 @@ def get_sub_status(user_data: dict) -> str:
 def format_number(num: float) -> str:
     """Форматирование чисел с разделителями"""
     return f"{num:,.2f}".replace(",", " ").replace(".", ",")
-
-def create_owner_panel_frame(title: str, content_lines: List[str]) -> str:
-    """Создает красивую рамку для панели владельца"""
-    # Находим максимальную длину строки
-    max_length = max(len(line) for line in content_lines) if content_lines else 0
-    width = max(max_length, 40)  # Минимальная ширина 40 символов
-    
-    # Верхняя граница
-    top_border = "╔" + "═" * (width + 2) + "╗\n"
-    
-    # Заголовок
-    title_line = f"║ 👑 {title.center(width)} ║\n"
-    separator = "╠" + "═" * (width + 2) + "╣\n"
-    
-    # Содержимое
-    content = ""
-    for line in content_lines:
-        content += f"║ {line.ljust(width)} ║\n"
-    
-    # Нижняя граница
-    bottom_border = "╚" + "═" * (width + 2) + "╝"
-    
-    return top_border + title_line + separator + content + bottom_border
-
-def create_stats_frame(title: str, stats_lines: List[str]) -> str:
-    """Создает красивую рамку для статистики"""
-    # Находим максимальную длину строки
-    max_length = max(len(line) for line in stats_lines) if stats_lines else 0
-    width = max(max_length, 40)
-    
-    # Верхняя граница
-    top_border = "╔" + "═" * (width + 2) + "╗\n"
-    
-    # Заголовок
-    title_line = f"║ 📊 {title.center(width)} ║\n"
-    separator = "╠" + "═" * (width + 2) + "╣\n"
-    
-    # Содержимое
-    content = ""
-    for line in stats_lines:
-        content += f"║ {line.ljust(width)} ║\n"
-    
-    # Нижняя граница
-    bottom_border = "╚" + "═" * (width + 2) + "╝"
-    
-    return top_border + title_line + separator + content + bottom_border
 
 # =================== ОБРАБОТКА ВСЕХ СООБЩЕНИЙ ===================
 @dp.message()
@@ -997,33 +954,45 @@ async def stats_cmd(message: Message):
     else:
         uptime_str = f"{uptime.seconds//3600} часов, {(uptime.seconds%3600)//60} минут"
     
-    # Создаем строки для рамки
+    # Создаем красивую рамку для статистики
     stats_lines = [
-        "👥 *Пользователи:*",
+        f"👥 *Пользователи:*",
         f"• Всего: {stats.get('total_users', 0)}",
         f"• Активных: {stats.get('active_users', 0)}",
         f"• С GOLD: {gold_users}",
-        "",
-        "💬 *Чаты:*",
+        f"",
+        f"💬 *Чаты:*",
         f"• Всего: {stats.get('chats_count', 0)}",
         f"• Активных: {active_chats}",
         f"• Группы: {stats.get('groups_count', 0)}",
         f"• Супергруппы: {stats.get('supergroups_count', 0)}",
         f"• Каналы: {stats.get('channels_count', 0)}",
-        "",
-        "💰 *Экономика:*",
+        f"",
+        f"💰 *Экономика:*",
         f"• Общий баланс: {format_number(total_balance)} ¢",
         f"• Всего заработано: {format_number(total_earned)} ¢",
         f"• Средний баланс: {format_number(total_balance / max(1, stats.get('total_users', 1)))} ¢",
-        "",
-        "📈 *Активность:*",
+        f"",
+        f"📈 *Активность:*",
         f"• Сообщений: {stats.get('total_messages', 0)}",
         f"• Фарм-команд: {stats.get('total_farm_commands', 0)}",
         f"• Время работы: {uptime_str}"
     ]
     
-    # Создаем красивую рамку
-    text = create_stats_frame("СТАТИСТИКА БОТА", stats_lines)
+    # Находим максимальную длину строки
+    max_length = max(len(line) for line in stats_lines) if stats_lines else 0
+    width = max(max_length, 40)
+    
+    # Создаем рамку
+    top_border = "╔" + "═" * (width + 2) + "╗\n"
+    title_line = f"║ 📊 {'СТАТИСТИКА БОТА'.center(width)} 📊 ║\n"
+    separator = "╠" + "═" * (width + 2) + "╣\n"
+    content = ""
+    for line in stats_lines:
+        content += f"║ {line.ljust(width)} ║\n"
+    bottom_border = "╚" + "═" * (width + 2) + "╝"
+    
+    text = top_border + title_line + separator + content + bottom_border
     
     # Добавляем информацию о последних чатах
     text += "\n\n🔄 *Последние 5 активных чатов:*\n"
@@ -1074,7 +1043,15 @@ async def refresh_stats_callback(callback_query: CallbackQuery):
         await callback_query.answer("⛔ Нет доступа!", show_alert=True)
         return
     
-    await stats_cmd(callback_query.message)
+    # Используем существующее сообщение для обновления
+    message = Message(
+        message_id=callback_query.message.message_id,
+        date=datetime.now(),
+        chat=callback_query.message.chat,
+        from_user=callback_query.from_user,
+        text=""
+    )
+    await stats_cmd(message)
     await callback_query.answer("✅ Статистика обновлена!")
 
 @dp.callback_query(lambda c: c.data == "all_chats_list")
@@ -1087,7 +1064,7 @@ async def all_chats_list_callback(callback_query: CallbackQuery):
     all_chats = db.get_all_chats()
     
     if not all_chats:
-        await callback_query.message.answer("📭 Бот еще не добавлен ни в один чат.")
+        await callback_query.message.edit_text("📭 Бот еще не добавлен ни в один чат.")
         await callback_query.answer()
         return
     
@@ -1134,7 +1111,7 @@ async def all_chats_list_callback(callback_query: CallbackQuery):
     await callback_query.message.edit_text(text, reply_markup=keyboard.as_markup(), parse_mode="Markdown")
     await callback_query.answer()
 
-# =================== ПАНЕЛЬ ВЛАДЕЛЬЦА С КРАСИВОЙ РАМКОЙ ===================
+# =================== ПАНЕЛЬ ВЛАДЕЛЬЦА ===================
 @dp.message(Command("owner"))
 async def owner_cmd(message: Message):
     if message.from_user.id != OWNER_ID:
@@ -1143,14 +1120,14 @@ async def owner_cmd(message: Message):
     
     # Проверяем, где отправлена команда
     if message.chat.type == ChatType.PRIVATE:
-        # В ЛС показываем красивую панель с рамкой
+        # В ЛС показываем красивую панель
         await show_owner_panel_private(message)
     else:
         # В группах показываем упрощенную панель
         await show_owner_panel_group(message)
 
 async def show_owner_panel_private(message: Message):
-    """Красивая панель владельца в личных сообщениях с рамкой"""
+    """Красивая панель владельца в личных сообщениях"""
     
     # Создаем строки для рамки
     content_lines = [
@@ -1267,16 +1244,21 @@ async def chats_cmd(message: Message):
         await message.answer("⛔ Нет доступа!")
         return
     
-    await all_chats_list_callback(CallbackQuery(
-        message=message,
-        from_user=message.from_user,
-        chat_instance="",
-        data="all_chats_list"
-    ))
+    # Создаем фиктивный callback query для использования существующей функции
+    class MockCallbackQuery:
+        def __init__(self, message, from_user):
+            self.message = message
+            self.from_user = from_user
+            self.data = "all_chats_list"
+            self.chat_instance = ""
+    
+    mock_callback = MockCallbackQuery(message, message.from_user)
+    await all_chats_list_callback(mock_callback)
 
 @dp.message(Command("give"))
 async def give_money(message: Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID: return
+    if message.from_user.id != OWNER_ID: 
+        return
     try:
         args = command.args.split()
         user_id, amount = int(args[0]), float(args[1])
@@ -1288,7 +1270,8 @@ async def give_money(message: Message, command: CommandObject):
 
 @dp.message(Command("set"))
 async def set_money(message: Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID: return
+    if message.from_user.id != OWNER_ID: 
+        return
     try:
         args = command.args.split()
         user_id, amount = int(args[0]), float(args[1])
@@ -1299,7 +1282,8 @@ async def set_money(message: Message, command: CommandObject):
 
 @dp.message(Command("gold"))
 async def give_gold(message: Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID: return
+    if message.from_user.id != OWNER_ID: 
+        return
     try:
         args = command.args.split()
         user_id = int(args[0])
@@ -1311,7 +1295,8 @@ async def give_gold(message: Message, command: CommandObject):
 
 @dp.message(Command("gold_forever"))
 async def gold_forever(message: Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID: return
+    if message.from_user.id != OWNER_ID: 
+        return
     try:
         user_id = int(command.args)
         db.give_gold(user_id, permanent=True)
@@ -1321,7 +1306,8 @@ async def gold_forever(message: Message, command: CommandObject):
 
 @dp.message(Command("remove_gold"))
 async def remove_gold_cmd(message: Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID: return
+    if message.from_user.id != OWNER_ID: 
+        return
     try:
         user_id = int(command.args)
         db.remove_gold(user_id)
@@ -1331,7 +1317,8 @@ async def remove_gold_cmd(message: Message, command: CommandObject):
 
 @dp.message(Command("ban"))
 async def ban_cmd(message: Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID: return
+    if message.from_user.id != OWNER_ID: 
+        return
     try:
         user_id = int(command.args)
         db.ban_user(user_id, True)
@@ -1341,7 +1328,8 @@ async def ban_cmd(message: Message, command: CommandObject):
 
 @dp.message(Command("unban"))
 async def unban_cmd(message: Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID: return
+    if message.from_user.id != OWNER_ID: 
+        return
     try:
         user_id = int(command.args)
         db.ban_user(user_id, False)
@@ -1351,7 +1339,8 @@ async def unban_cmd(message: Message, command: CommandObject):
 
 @dp.message(Command("resetcd"))
 async def reset_cd(message: Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID: return
+    if message.from_user.id != OWNER_ID: 
+        return
     try:
         user_id = int(command.args)
         db.clear_cooldowns(user_id)
@@ -1362,7 +1351,8 @@ async def reset_cd(message: Message, command: CommandObject):
 # =================== УПРАВЛЕНИЕ УДАЧЕЙ ===================
 @dp.message(Command("luck"))
 async def set_luck_cmd(message: Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID: return
+    if message.from_user.id != OWNER_ID: 
+        return
     try:
         args = command.args.split()
         user_id = int(args[0])
@@ -1379,7 +1369,8 @@ async def set_luck_cmd(message: Message, command: CommandObject):
 
 @dp.message(Command("temp_luck"))
 async def set_temp_luck_cmd(message: Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID: return
+    if message.from_user.id != OWNER_ID: 
+        return
     try:
         args = command.args.split()
         user_id = int(args[0])
@@ -1413,7 +1404,8 @@ async def set_temp_luck_cmd(message: Message, command: CommandObject):
 
 @dp.message(Command("luck_all"))
 async def set_luck_all_cmd(message: Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID: return
+    if message.from_user.id != OWNER_ID: 
+        return
     try:
         if not command.args:
             await message.answer("❌ Укажите значение удачи!\n/luck_all <значение>")
@@ -1442,7 +1434,8 @@ async def set_luck_all_cmd(message: Message, command: CommandObject):
 
 @dp.message(Command("luck_reset_all"))
 async def reset_luck_all_cmd(message: Message):
-    if message.from_user.id != OWNER_ID: return
+    if message.from_user.id != OWNER_ID: 
+        return
     
     keyboard = InlineKeyboardBuilder()
     keyboard.row(
@@ -1459,7 +1452,8 @@ async def reset_luck_all_cmd(message: Message):
 
 @dp.message(Command("broadcast"))
 async def broadcast_cmd(message: Message, command: CommandObject):
-    if message.from_user.id != OWNER_ID: return
+    if message.from_user.id != OWNER_ID: 
+        return
     
     if not command.args:
         await message.answer("❌ Укажите текст для рассылки!\n/broadcast <текст>")
@@ -1746,27 +1740,96 @@ async def farm_command(message: Message):
 # =================== CALLBACK ОБРАБОТЧИКИ ===================
 @dp.callback_query(lambda c: c.data == "start_menu")
 async def start_callback(callback_query: CallbackQuery):
-    await start_cmd(callback_query.message)
+    user_id = callback_query.from_user.id
+    
+    if db.is_banned(user_id):
+        await callback_query.answer("⛔ Вы забанены!", show_alert=True)
+        return
+    
+    # Создаем сообщение для обработки
+    message = Message(
+        message_id=callback_query.message.message_id,
+        date=datetime.now(),
+        chat=callback_query.message.chat,
+        from_user=callback_query.from_user,
+        text=""
+    )
+    
+    await start_cmd(message)
     await callback_query.answer()
 
 @dp.callback_query(lambda c: c.data == "profile")
 async def profile_callback(callback_query: CallbackQuery):
-    await profile_cmd(callback_query.message)
+    user_id = callback_query.from_user.id
+    
+    if user_id != OWNER_ID and not db.get_channel_check(user_id):
+        await callback_query.answer("❌ Сначала подпишитесь на канал!", show_alert=True)
+        return
+    
+    # Создаем сообщение для обработки
+    message = Message(
+        message_id=callback_query.message.message_id,
+        date=datetime.now(),
+        chat=callback_query.message.chat,
+        from_user=callback_query.from_user,
+        text=""
+    )
+    
+    await profile_cmd(message)
     await callback_query.answer()
 
 @dp.callback_query(lambda c: c.data == "shop")
 async def shop_callback(callback_query: CallbackQuery):
-    await shop_cmd(callback_query.message)
+    user_id = callback_query.from_user.id
+    
+    if user_id != OWNER_ID and not db.get_channel_check(user_id):
+        await callback_query.answer("❌ Сначала подпишитесь!", show_alert=True)
+        return
+    
+    # Создаем сообщение для обработки
+    message = Message(
+        message_id=callback_query.message.message_id,
+        date=datetime.now(),
+        chat=callback_query.message.chat,
+        from_user=callback_query.from_user,
+        text=""
+    )
+    
+    await shop_cmd(message)
     await callback_query.answer()
 
 @dp.callback_query(lambda c: c.data == "events")
 async def events_callback(callback_query: CallbackQuery):
-    await events_cmd(callback_query.message)
+    user_id = callback_query.from_user.id
+    
+    if user_id != OWNER_ID and not db.get_channel_check(user_id):
+        await callback_query.answer("❌ Сначала подпишитесь!", show_alert=True)
+        return
+    
+    # Создаем сообщение для обработки
+    message = Message(
+        message_id=callback_query.message.message_id,
+        date=datetime.now(),
+        chat=callback_query.message.chat,
+        from_user=callback_query.from_user,
+        text=""
+    )
+    
+    await events_cmd(message)
     await callback_query.answer()
 
 @dp.callback_query(lambda c: c.data == "help_menu")
 async def help_callback(callback_query: CallbackQuery):
-    await help_cmd(callback_query.message)
+    # Создаем сообщение для обработки
+    message = Message(
+        message_id=callback_query.message.message_id,
+        date=datetime.now(),
+        chat=callback_query.message.chat,
+        from_user=callback_query.from_user,
+        text=""
+    )
+    
+    await help_cmd(message)
     await callback_query.answer()
 
 @dp.callback_query(lambda c: c.data == "owner_panel")
@@ -1775,7 +1838,16 @@ async def owner_panel_callback(callback_query: CallbackQuery):
         await callback_query.answer("⛔ Нет доступа!", show_alert=True)
         return
     
-    await owner_cmd(callback_query.message)
+    # Создаем сообщение для обработки
+    message = Message(
+        message_id=callback_query.message.message_id,
+        date=datetime.now(),
+        chat=callback_query.message.chat,
+        from_user=callback_query.from_user,
+        text=""
+    )
+    
+    await owner_cmd(message)
     await callback_query.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("farm_"))
@@ -2185,10 +2257,19 @@ async def broadcast_confirm_callback(callback_query: CallbackQuery):
     original_msg_id = int(callback_query.data.replace("broadcast_confirm_", ""))
     
     try:
-        original_message = await bot.get_message(
-            chat_id=callback_query.message.chat.id,
-            message_id=original_msg_id
-        )
+        # Получаем оригинальное сообщение
+        chat_id = callback_query.message.chat.id
+        original_message = None
+        
+        try:
+            original_message = await bot.get_message(chat_id, original_msg_id)
+        except:
+            # Пытаемся найти сообщение в истории
+            pass
+        
+        if not original_message:
+            await callback_query.answer("❌ Сообщение не найдено!", show_alert=True)
+            return
         
         broadcast_text = original_message.text
         if "\n\n" in broadcast_text:
