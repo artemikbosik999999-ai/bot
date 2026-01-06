@@ -12,9 +12,17 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ChatMemberStatus
 
 # =================== КОНСТАНТЫ ===================
-OWNER_ID = 7119681628
-CHANNEL_USERNAME = "artem_bori"
-BOT_TOKEN = "ВАШ_ТОКЕН_БОТА"  # Замените на ваш токен!
+# Безопасная загрузка из настроек Bothost
+OWNER_ID = int(os.environ.get("OWNER_ID", "7119681628"))
+CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "artem_bori")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+
+# Проверка токена
+if not BOT_TOKEN:
+    print("❌ ОШИБКА: BOT_TOKEN не установлен!")
+    print("Добавьте в настройках Bothost:")
+    print("BOT_TOKEN = ваш_токен_бота")
+    exit(1)
 
 FARM_COMMANDS = {
     "кактус": {"emoji": "🌵", "min": 10, "max": 50},
@@ -27,22 +35,37 @@ FARM_COMMANDS = {
 # =================== БАЗА ДАННЫХ ===================
 class Database:
     def __init__(self):
-        # Подключаемся к Redis
-        try:
-            self.redis = redis.Redis(
-                host='localhost',
-                port=6379,
-                db=0,
-                decode_responses=True,
-                socket_connect_timeout=5
-            )
-            self.redis.ping()
-            print("✅ Redis подключен")
-        except:
-            # Если Redis нет, используем словарь в памяти
-            print("⚠️ Redis не найден, использую память")
-            self.memory_db = {}
-            self.redis = None
+        # Bothost дает REDIS_URL
+        redis_url = os.environ.get("REDIS_URL")
+        
+        if redis_url:
+            try:
+                self.redis = redis.from_url(
+                    redis_url,
+                    decode_responses=True,
+                    socket_connect_timeout=5
+                )
+                self.redis.ping()
+                print("✅ Redis Bothost подключен")
+            except Exception as e:
+                print(f"⚠️ Redis ошибка: {e}, использую память")
+                self.memory_db = {}
+                self.redis = None
+        else:
+            try:
+                self.redis = redis.Redis(
+                    host='localhost',
+                    port=6379,
+                    db=0,
+                    decode_responses=True,
+                    socket_connect_timeout=5
+                )
+                self.redis.ping()
+                print("✅ Локальный Redis подключен")
+            except:
+                print("⚠️ Redis не найден, использую память")
+                self.memory_db = {}
+                self.redis = None
     
     def _get_key(self, user_id: int) -> str:
         return f"user:{user_id}"
@@ -222,30 +245,570 @@ def get_sub_status(user_data: dict) -> str:
             return f"✨ GOLD ({days} дней)"
     return "⭕ Подписка истекла"
 
+# =================== ПРОВЕРКА ПОДПИСКИ НА КАНАЛ ===================
+@dp.message(Command("check"))
+async def check_channel(message: Message):
+    keyboard = InlineKeyboardBuilder()
+    keyboard.row(InlineKeyboardButton(text="📢 Подписаться", url=f"https://t.me/{CHANNEL_USERNAME}"))
+    keyboard.row(InlineKeyboardButton(text="✅ Проверить", callback_data="verify"))
+    text = (
+        f"📢 *Подписка на канал*\n\n"
+        f"Подпишитесь на канал: @{CHANNEL_USERNAME}\n"
+        f"и нажмите 'Проверить'"
+    )
+    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard.as_markup())
+
+@dp.callback_query(lambda c: c.data == "verify")
+async def verify_callback(callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    if await check_channel_subscription(user_id):
+        db.set_channel_check(user_id, True)
+        text = "✅ *Подписка подтверждена!* 🎉"
+        keyboard = InlineKeyboardBuilder()
+        keyboard.row(InlineKeyboardButton(text="🚀 Начать", callback_data="start"))
+    else:
+        text = "❌ *Вы не подписаны!*\n\nПодпишитесь и нажмите 'Проверить' снова"
+        keyboard = InlineKeyboardBuilder()
+        keyboard.row(InlineKeyboardButton(text="📢 Подписаться", url=f"https://t.me/{CHANNEL_USERNAME}"))
+        keyboard.row(InlineKeyboardButton(text="🔄 Проверить", callback_data="verify"))
+    await callback_query.message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard.as_markup())
+    await callback_query.answer()
+
+# =================== ГЛАВНОЕ МЕНЮ С КНОПКАМИ ===================
+@dp.message(Command("start"))
+async def start_cmd(message: Message):
+    user_id = message.from_user.id
+    
+    if db.is_banned(user_id):
+        await message.answer("⛔ Вы забанены!")
+        return
+    
+    if user_id != OWNER_ID and not db.get_channel_check(user_id):
+        await check_channel(message)
+        return
+    
+    user_data = db.get_user_data(user_id)
+    
+    # Главное меню с кнопками
+    text = (
+        f"🎮 *Farm Bot*\n\n"
+        f"💰 Баланс: `{user_data['balance']:.2f} ¢`\n"
+        f"✨ Сила: `{user_data['star_power']}`\n"
+        f"⏳ Урожайность: `{user_data['productivity']:.2f}`\n\n"
+        "🌵 *Фарм команды:*\n"
+        "`кактус` `ферма` `шахта` `сад` `охота`\n"
+        "(кулдаун 2 часа)"
+    )
+    
+    keyboard = InlineKeyboardBuilder()
+    keyboard.row(
+        InlineKeyboardButton(text="📊 Профиль", callback_data="profile"),
+        InlineKeyboardButton(text="🛒 Магазин", callback_data="shop")
+    )
+    keyboard.row(
+        InlineKeyboardButton(text="🎪 Эвенты", callback_data="events"),
+        InlineKeyboardButton(text="❓ Помощь", callback_data="help_menu")
+    )
+    
+    # Кнопка только для владельца
+    if user_id == OWNER_ID:
+        keyboard.row(InlineKeyboardButton(text="👑 Панель владельца", callback_data="owner_panel"))
+    
+    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard.as_markup())
+
+# =================== ПРОФИЛЬ С КНОПКАМИ ===================
+@dp.message(Command("profile"))
+async def profile_cmd(message: Message):
+    user_id = message.from_user.id
+    
+    if user_id != OWNER_ID and not db.get_channel_check(user_id):
+        await message.answer("❌ Сначала подпишитесь на канал! /check")
+        return
+    
+    await show_profile(user_id, message.chat.id)
+
+async def show_profile(user_id: int, chat_id: int):
+    user_data = db.get_user_data(user_id)
+    sub_status = get_sub_status(user_data)
+    is_admin = await is_chat_admin(user_id, chat_id)
+    has_gold = db.check_gold(user_id)
+    
+    # Статус пользователя
+    if user_id == OWNER_ID:
+        status = "👑 *Владелец*"
+    elif is_admin and has_gold:
+        status = f"🛡️ *Админ* ({sub_status})"
+    elif has_gold:
+        status = f"✨ *GOLD* ({sub_status})"
+    else:
+        status = f"👤 *Обычный* ({sub_status})"
+    
+    text = (
+        f"📊 *Профиль*\n\n"
+        f"{status}\n"
+        f"💰 Баланс: `{user_data['balance']:.2f} ¢`\n"
+        f"✨ Сила: `{user_data['star_power']}`\n"
+        f"⏳ Урожайность: `{user_data['productivity']:.2f}`\n"
+        f"📢 Канал: `{'✅' if db.get_channel_check(user_id) else '❌'}`\n\n"
+        "⏰ *Кулдауны:*\n"
+    )
+    
+    for cmd in FARM_COMMANDS:
+        cd = db.get_cooldown(user_id, cmd)
+        if cd:
+            text += f"• {cmd}: {format_time(cd)}\n"
+        else:
+            text += f"• {cmd}: ✅ готово\n"
+    
+    keyboard = InlineKeyboardBuilder()
+    keyboard.row(
+        InlineKeyboardButton(text="🌵 Кактус", callback_data="farm_cactus"),
+        InlineKeyboardButton(text="🚜 Ферма", callback_data="farm_farm"),
+        InlineKeyboardButton(text="⛏️ Шахта", callback_data="farm_mine")
+    )
+    keyboard.row(
+        InlineKeyboardButton(text="🌻 Сад", callback_data="farm_garden"),
+        InlineKeyboardButton(text="🏹 Охота", callback_data="farm_hunt")
+    )
+    keyboard.row(
+        InlineKeyboardButton(text="🛒 Магазин", callback_data="shop"),
+        InlineKeyboardButton(text="🎪 Эвенты", callback_data="events")
+    )
+    keyboard.row(InlineKeyboardButton(text="🔙 Назад", callback_data="start_menu"))
+    
+    # Кнопка запуска эвента для админов с GOLD
+    if is_admin and has_gold:
+        keyboard.row(InlineKeyboardButton(text="🚀 Запустить эвент", callback_data="event_start"))
+    
+    # Кнопка панели только для владельца
+    if user_id == OWNER_ID:
+        keyboard.row(InlineKeyboardButton(text="👑 Панель владельца", callback_data="owner_panel"))
+    
+    return text, keyboard
+
+# =================== ПАНЕЛЬ ВЛАДЕЛЬЦА С КНОПКАМИ ===================
+async def show_owner_panel(user_id: int):
+    text = (
+        "👑 *Панель владельца*\n\n"
+        "💰 *Управление балансами:*\n"
+        "`/give <id> <сумма>` - выдать деньги\n"
+        "`/set <id> <сумма>` - установить баланс\n\n"
+        "🎖️ *Управление подписками:*\n"
+        "`/gold <id> <дни>` - выдать GOLD\n"
+        "`/gold_forever <id>` - вечная GOLD\n"
+        "`/remove_gold <id>` - удалить подписку\n\n"
+        "⚙️ *Администрация:*\n"
+        "`/ban <id>` - забанить\n"
+        "`/unban <id>` - разбанить\n"
+        "`/resetcd <id>` - сбросить кулдауны\n\n"
+        "🎪 *Эвенты:*\n"
+        "`/owner_event` - запустить эвент\n"
+        "`/stop_event` - остановить эвент"
+    )
+    
+    keyboard = InlineKeyboardBuilder()
+    keyboard.row(
+        InlineKeyboardButton(text="💰 Выдать деньги", callback_data="owner_give"),
+        InlineKeyboardButton(text="🎖️ Выдать GOLD", callback_data="owner_gold")
+    )
+    keyboard.row(
+        InlineKeyboardButton(text="⛔ Забанить", callback_data="owner_ban"),
+        InlineKeyboardButton(text="✅ Разбанить", callback_data="owner_unban")
+    )
+    keyboard.row(
+        InlineKeyboardButton(text="🎪 Эвент", callback_data="owner_event"),
+        InlineKeyboardButton(text="🔄 Сбросить кд", callback_data="owner_resetcd")
+    )
+    keyboard.row(InlineKeyboardButton(text="🔙 Назад", callback_data="profile"))
+    
+    return text, keyboard
+
+# =================== МАГАЗИН С КНОПКАМИ ===================
+@dp.message(Command("shop"))
+async def shop_cmd(message: Message):
+    user_id = message.from_user.id
+    
+    if user_id != OWNER_ID and not db.get_channel_check(user_id):
+        await message.answer("❌ Сначала подпишитесь! /check")
+        return
+    
+    user_data = db.get_user_data(user_id)
+    has_gold = db.check_gold(user_id)
+    
+    text = (
+        "🛒 *Магазин*\n\n"
+        "✨ *Сила звёздности* (100 ¢)\n"
+        "+0.5 ¢ к каждой награде\n\n"
+        "⏳ *Урожайность* (150 ¢)\n"
+        "×1.1 к наградам\n\n"
+        "🎖️ *GOLD подписка* (1500 ¢)\n"
+        "+20% к наградам на 30 дней\n\n"
+    )
+    
+    if has_gold:
+        text += f"• У вас: {get_sub_status(user_data)}\n"
+    
+    text += f"\n💰 Ваш баланс: `{user_data['balance']:.2f} ¢`"
+    
+    keyboard = InlineKeyboardBuilder()
+    keyboard.row(
+        InlineKeyboardButton(text="✨ Купить Силу +1 (100¢)", callback_data="buy_star"),
+        InlineKeyboardButton(text="⏳ Купить Урожайность (150¢)", callback_data="buy_prod")
+    )
+    
+    if has_gold:
+        keyboard.row(InlineKeyboardButton(text="🔄 Продлить GOLD (1500¢)", callback_data="buy_gold"))
+    else:
+        keyboard.row(InlineKeyboardButton(text="🎖️ Купить GOLD (1500¢)", callback_data="buy_gold"))
+    
+    keyboard.row(InlineKeyboardButton(text="🔙 Назад", callback_data="profile"))
+    
+    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard.as_markup())
+
+# =================== ЭВЕНТЫ С КНОПКАМИ ===================
+@dp.message(Command("events"))
+async def events_cmd(message: Message):
+    user_id = message.from_user.id
+    
+    if user_id != OWNER_ID and not db.get_channel_check(user_id):
+        await message.answer("❌ Сначала подпишитесь! /check")
+        return
+    
+    global active_event
+    
+    text = "🎪 *Эвенты*\n\n"
+    
+    if active_event:
+        parts = len(event_participants.get(active_event['id'], []))
+        time_left = format_time(active_event['end_time'])
+        text += (
+            f"🚀 *Активный эвент!*\n"
+            f"🎯 {active_event['type']}\n"
+            f"💰 {active_event['reward']} ¢\n"
+            f"👥 {parts} участников\n"
+            f"⏳ {time_left}\n\n"
+            f"🆔 ID: `{active_event['id']}`"
+        )
+    else:
+        text += (
+            "📭 *Нет активных эвентов*\n\n"
+            "✨ *Как запустить:*\n"
+            "1. GOLD подписка\n"
+            "2. Быть админом чата\n"
+            "3. Нажать 'Запустить эвент'\n\n"
+            "💰 *Награды:* 100-1000 ¢"
+        )
+    
+    keyboard = InlineKeyboardBuilder()
+    
+    if active_event:
+        keyboard.row(InlineKeyboardButton(text="🎪 Присоединиться", callback_data=f"join_event_{active_event['id']}"))
+    else:
+        is_admin = await is_chat_admin(user_id, message.chat.id)
+        if is_admin and db.check_gold(user_id):
+            keyboard.row(InlineKeyboardButton(text="🚀 Запустить эвент", callback_data="event_start"))
+    
+    keyboard.row(InlineKeyboardButton(text="📊 Профиль", callback_data="profile"))
+    keyboard.row(InlineKeyboardButton(text="🔙 Назад", callback_data="start_menu"))
+    
+    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard.as_markup())
+
+@dp.message(Command("help"))
+async def help_cmd(message: Message):
+    text = (
+        "❓ *Помощь*\n\n"
+        "🌵 *Фарм команды:*\n"
+        "кактус, ферма, шахта, сад, охота\n"
+        "(кулдаун 2 часа)\n\n"
+        "📋 *Основные команды:*\n"
+        "`/start` - начало\n"
+        "`/profile` - профиль\n"
+        "`/shop` - магазин\n"
+        "`/events` - эвенты\n"
+        "`/check` - подписка на канал\n\n"
+        "🎪 *Эвенты:*\n"
+        "Запускают админы с GOLD\n"
+        "Участвовать может любой\n\n"
+        "🎖️ *GOLD подписка:*\n"
+        "+20% к наградам\n"
+        "1500 ¢ / 30 дней"
+    )
+    
+    keyboard = InlineKeyboardBuilder()
+    keyboard.row(
+        InlineKeyboardButton(text="🚀 Начать", callback_data="start_menu"),
+        InlineKeyboardButton(text="📊 Профиль", callback_data="profile")
+    )
+    
+    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard.as_markup())
+
+# =================== ОБРАБОТЧИКИ КНОПОК ===================
+@dp.callback_query(lambda c: c.data == "start_menu")
+async def start_callback(callback_query: CallbackQuery):
+    await start_cmd(callback_query.message)
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data == "profile")
+async def profile_callback(callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    text, keyboard = await show_profile(user_id, callback_query.message.chat.id)
+    await callback_query.message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard.as_markup())
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data == "shop")
+async def shop_callback(callback_query: CallbackQuery):
+    await shop_cmd(callback_query.message)
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data == "events")
+async def events_callback(callback_query: CallbackQuery):
+    await events_cmd(callback_query.message)
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data == "help_menu")
+async def help_callback(callback_query: CallbackQuery):
+    await help_cmd(callback_query.message)
+    await callback_query.answer()
+
+@dp.callback_query(lambda c: c.data == "owner_panel")
+async def owner_panel_callback(callback_query: CallbackQuery):
+    if callback_query.from_user.id != OWNER_ID:
+        await callback_query.answer("⛔ Нет доступа!", show_alert=True)
+        return
+    
+    text, keyboard = await show_owner_panel(callback_query.from_user.id)
+    await callback_query.message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard.as_markup())
+    await callback_query.answer()
+
+# =================== ФАРМ ЧЕРЕЗ КНОПКИ ===================
+@dp.callback_query(lambda c: c.data.startswith("farm_"))
+async def farm_button_callback(callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    cmd = callback_query.data.replace("farm_", "")
+    
+    # Маппинг кнопок на команды
+    cmd_map = {
+        "cactus": "кактус",
+        "farm": "ферма",
+        "mine": "шахта",
+        "garden": "сад",
+        "hunt": "охота"
+    }
+    
+    if cmd not in cmd_map:
+        await callback_query.answer("❌ Неизвестная команда")
+        return
+    
+    cmd_name = cmd_map[cmd]
+    
+    if db.is_banned(user_id):
+        await callback_query.answer("⛔ Вы забанены!", show_alert=True)
+        return
+    
+    if user_id != OWNER_ID and not db.get_channel_check(user_id):
+        await callback_query.answer("❌ Сначала подпишитесь на канал!", show_alert=True)
+        return
+    
+    # Проверка кулдауна
+    cd = db.get_cooldown(user_id, cmd_name)
+    if cd:
+        await callback_query.answer(f"⏳ {cmd_name} на кулдауне! {format_time(cd)}", show_alert=True)
+        return
+    
+    user_data = db.get_user_data(user_id)
+    cmd_info = FARM_COMMANDS[cmd_name]
+    
+    # Базовая награда
+    reward = random.randint(cmd_info["min"], cmd_info["max"])
+    
+    # Бонус силы
+    reward += user_data['star_power'] * 0.5
+    
+    # Урожайность
+    reward *= user_data['productivity']
+    
+    # GOLD подписка
+    if db.check_gold(user_id):
+        reward *= 1.2
+    
+    # Случайный бонус 26%
+    if random.random() < 0.26:
+        bonus = random.randint(5, 15)
+        reward += bonus
+        bonus_text = f"☢️ +{bonus} ¢\n"
+    else:
+        bonus_text = ""
+    
+    reward = round(reward, 2)
+    
+    # Сохраняем
+    db.update_balance(user_id, reward)
+    db.set_cooldown(user_id, cmd_name, hours=2)
+    
+    new_balance = db.get_user_data(user_id)['balance']
+    
+    # Ответ
+    response = (
+        f"{cmd_info['emoji']} *{cmd_name.upper()}* ✅ *ЗАЧЁТ!*\n\n"
+        f"💰 +{reward:.2f} ¢\n"
+        f"{bonus_text}"
+        f"\n💳 Баланс: *{new_balance:.2f} ¢*\n\n"
+        f"⏳ Возвращайтесь через *2 часа*"
+    )
+    
+    await callback_query.message.answer(response, parse_mode="Markdown")
+    await callback_query.answer()
+
+# =================== ПОКУПКА В МАГАЗИНЕ ===================
+@dp.callback_query(lambda c: c.data in ["buy_star", "buy_prod", "buy_gold"])
+async def buy_callback(callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    action = callback_query.data
+    
+    if action == "buy_star":
+        user_data = db.get_user_data(user_id)
+        if user_data['balance'] >= 100:
+            db.update_balance(user_id, -100)
+            user_data['star_power'] += 1
+            db.save_user_data(user_id, user_data)
+            text = "✅ *Сила звёздности +1!*\n\nТеперь +0.5 ¢ к каждой награде!"
+        else:
+            text = "❌ *Недостаточно средств!*\n\nНужно: 100 ¢"
+    
+    elif action == "buy_prod":
+        user_data = db.get_user_data(user_id)
+        if user_data['balance'] >= 150:
+            db.update_balance(user_id, -150)
+            user_data['productivity'] = round(user_data['productivity'] * 1.1, 2)
+            db.save_user_data(user_id, user_data)
+            text = f"✅ *Урожайность увеличена!*\n\nТеперь: `{user_data['productivity']}`"
+        else:
+            text = "❌ *Недостаточно средств!*\n\nНужно: 150 ¢"
+    
+    elif action == "buy_gold":
+        user_data = db.get_user_data(user_id)
+        if user_data['balance'] >= 1500:
+            if db.buy_gold(user_id):
+                text = "✅ *GOLD подписка активирована!*\n\n+20% к наградам на 30 дней!"
+            else:
+                text = "❌ Ошибка!"
+        else:
+            text = "❌ *Недостаточно средств!*\n\nНужно: 1500 ¢"
+    
+    await callback_query.message.edit_text(text, parse_mode="Markdown")
+    await callback_query.answer()
+
+# =================== ЭВЕНТЫ ЧЕРЕЗ КНОПКИ ===================
+@dp.callback_query(lambda c: c.data == "event_start")
+async def event_start_callback(callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    chat_id = callback_query.message.chat.id
+    
+    if user_id != OWNER_ID and not db.get_channel_check(user_id):
+        await callback_query.answer("❌ Сначала подпишитесь!", show_alert=True)
+        return
+    
+    if not await is_chat_admin(user_id, chat_id):
+        await callback_query.answer("❌ Только админы чата!", show_alert=True)
+        return
+    
+    if not db.check_gold(user_id):
+        await callback_query.answer("❌ Нужна GOLD подписка!", show_alert=True)
+        return
+    
+    global active_event
+    if active_event:
+        await callback_query.answer("❌ Уже есть активный эвент!", show_alert=True)
+        return
+    
+    # Создаем эвент
+    event_types = [("🎯 Обычный", 100, 300), ("🚀 Средний", 300, 600), ("💎 Мега", 600, 1000)]
+    etype, emin, emax = random.choice(event_types)
+    reward = random.randint(emin, emax)
+    event_id = random.randint(1000, 9999)
+    
+    active_event = {
+        'id': event_id,
+        'type': etype,
+        'reward': reward,
+        'end_time': datetime.now() + timedelta(hours=1),
+        'chat_id': chat_id,
+        'creator': user_id
+    }
+    event_participants[event_id] = []
+    
+    text = (
+        f"🎪 *Новый эвент!*\n\n"
+        f"🎯 {etype}\n"
+        f"💰 {reward} ¢\n"
+        f"⏳ 1 час\n"
+        f"🆔 {event_id}\n\n"
+        f"Присоединиться: нажмите кнопку ниже"
+    )
+    
+    keyboard = InlineKeyboardBuilder()
+    keyboard.row(InlineKeyboardButton(text="🎪 Присоединиться", callback_data=f"join_event_{event_id}"))
+    keyboard.row(InlineKeyboardButton(text="📊 Профиль", callback_data="profile"))
+    
+    await callback_query.message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard.as_markup())
+    event_participants[event_id].append(user_id)
+    await callback_query.answer("✅ Эвент запущен!")
+
+@dp.callback_query(lambda c: c.data.startswith("join_event_"))
+async def join_event_callback(callback_query: CallbackQuery):
+    global active_event
+    
+    if not active_event:
+        await callback_query.answer("❌ Нет активных эвентов!", show_alert=True)
+        return
+    
+    event_id = int(callback_query.data.replace("join_event_", ""))
+    if event_id != active_event['id']:
+        await callback_query.answer("❌ Эвент уже завершен!", show_alert=True)
+        return
+    
+    user_id = callback_query.from_user.id
+    
+    # Проверка чата для обычных админов
+    if active_event['creator'] != OWNER_ID and active_event.get('chat_id') != callback_query.message.chat.id:
+        await callback_query.answer("❌ Этот эвент в другом чате!", show_alert=True)
+        return
+    
+    if user_id in event_participants.get(active_event['id'], []):
+        await callback_query.answer("✅ Вы уже участвуете!", show_alert=True)
+        return
+    
+    event_participants[active_event['id']].append(user_id)
+    parts = len(event_participants[active_event['id']])
+    time_left = format_time(active_event['end_time'])
+    
+    await callback_query.answer(f"🎉 Вы присоединились к эвенту! {parts} участников")
+    
+    # Обновляем сообщение
+    text = (
+        f"🎪 *Эвент*\n\n"
+        f"🎯 {active_event['type']}\n"
+        f"💰 {active_event['reward']} ¢\n"
+        f"👥 {parts} участников\n"
+        f"⏳ {time_left}\n\n"
+        f"🆔 ID: `{active_event['id']}`"
+    )
+    
+    keyboard = InlineKeyboardBuilder()
+    keyboard.row(InlineKeyboardButton(text="🎪 Присоединиться", callback_data=f"join_event_{active_event['id']}"))
+    keyboard.row(InlineKeyboardButton(text="📊 Профиль", callback_data="profile"))
+    
+    await callback_query.message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard.as_markup())
+
 # =================== КОМАНДЫ ВЛАДЕЛЬЦА ===================
 @dp.message(Command("owner"))
 async def owner_cmd(message: Message):
     if message.from_user.id != OWNER_ID:
         await message.answer("⛔ Нет доступа!")
         return
-    text = (
-        "👑 *Панель владельца*\n\n"
-        "💰 *Балансы:*\n"
-        "`/give <id> <сумма>` - выдать\n"
-        "`/set <id> <сумма>` - установить\n"
-        "`/resetcd <id>` - сбросить кулдауны\n\n"
-        "🎖️ *Подписки:*\n"
-        "`/gold <id> <дни>` - выдать GOLD\n"
-        "`/gold_forever <id>` - вечная GOLD\n"
-        "`/remove_gold <id>` - удалить\n\n"
-        "⚙️ *Админ:*\n"
-        "`/ban <id>` - забанить\n"
-        "`/unban <id>` - разбанить\n\n"
-        "🎪 *Эвенты:*\n"
-        "`/owner_event` - запустить эвент\n"
-        "`/stop_event` - остановить эвент"
-    )
-    await message.answer(text, parse_mode="Markdown")
+    
+    text, keyboard = await show_owner_panel(message.from_user.id)
+    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard.as_markup())
 
 @dp.message(Command("give"))
 async def give_money(message: Message, command: CommandObject):
@@ -332,274 +895,6 @@ async def reset_cd(message: Message, command: CommandObject):
     except:
         await message.answer("❌ Ошибка! Использование: `/resetcd <id>`")
 
-# =================== ПРОВЕРКА ПОДПИСКИ НА КАНАЛ ===================
-@dp.message(Command("check"))
-async def check_channel(message: Message):
-    keyboard = InlineKeyboardBuilder()
-    keyboard.row(InlineKeyboardButton(text="📢 Подписаться", url=f"https://t.me/{CHANNEL_USERNAME}"))
-    keyboard.row(InlineKeyboardButton(text="✅ Проверить", callback_data="verify"))
-    text = (
-        f"📢 *Подписка на канал*\n\n"
-        f"Подпишитесь на канал: @{CHANNEL_USERNAME}\n"
-        f"и нажмите 'Проверить'"
-    )
-    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard.as_markup())
-
-@dp.callback_query(lambda c: c.data == "verify")
-async def verify_callback(callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    if await check_channel_subscription(user_id):
-        db.set_channel_check(user_id, True)
-        text = "✅ *Подписка подтверждена!* 🎉"
-        keyboard = InlineKeyboardBuilder()
-        keyboard.row(InlineKeyboardButton(text="🚀 Начать", callback_data="start"))
-    else:
-        text = "❌ *Вы не подписаны!*\n\nПодпишитесь и нажмите 'Проверить' снова"
-        keyboard = InlineKeyboardBuilder()
-        keyboard.row(InlineKeyboardButton(text="📢 Подписаться", url=f"https://t.me/{CHANNEL_USERNAME}"))
-        keyboard.row(InlineKeyboardButton(text="🔄 Проверить", callback_data="verify"))
-    await callback_query.message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard.as_markup())
-    await callback_query.answer()
-
-# =================== ОСНОВНЫЕ КОМАНДЫ ===================
-@dp.message(Command("start"))
-async def start_cmd(message: Message):
-    user_id = message.from_user.id
-    
-    if db.is_banned(user_id):
-        await message.answer("⛔ Вы забанены!")
-        return
-    
-    if user_id != OWNER_ID and not db.get_channel_check(user_id):
-        await check_channel(message)
-        return
-    
-    user_data = db.get_user_data(user_id)
-    is_admin = await is_chat_admin(user_id, message.chat.id)
-    has_gold = db.check_gold(user_id)
-    sub_status = get_sub_status(user_data)
-    
-    # Статус пользователя
-    if user_id == OWNER_ID:
-        status = "👑 *Владелец* (/owner)"
-    elif is_admin and has_gold:
-        status = f"🛡️ *Админ* ({sub_status}) - /event_start"
-    elif has_gold:
-        status = f"✨ *GOLD* ({sub_status})"
-    else:
-        status = f"👤 *Обычный* ({sub_status})"
-    
-    # Приветствие
-    text = (
-        f"🎮 *Farm Bot*\n\n"
-        f"{status}\n\n"
-        f"💰 Баланс: `{user_data['balance']:.2f} ¢`\n"
-        f"✨ Сила: `{user_data['star_power']}`\n"
-        f"⏳ Урожайность: `{user_data['productivity']:.2f}`\n\n"
-        "🌵 *Фарм команды:*\n"
-        "`кактус` `ферма` `шахта`\n"
-        "`сад` `охота`\n(кулдаун 2 часа)\n\n"
-        "📋 *Команды:*\n"
-        "`/profile` - профиль\n"
-        "`/shop` - магазин\n"
-        "`/events` - эвенты\n"
-        "`/help` - помощь"
-    )
-    
-    keyboard = InlineKeyboardBuilder()
-    keyboard.row(
-        InlineKeyboardButton(text="🛒 Магазин", callback_data="shop"),
-        InlineKeyboardButton(text="📊 Профиль", callback_data="profile")
-    )
-    
-    if active_event and active_event.get('chat_id') == message.chat.id:
-        text += f"\n\n🎪 *Активный эвент!*\n/join {active_event['id']}"
-    
-    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard.as_markup())
-
-@dp.message(Command("profile"))
-async def profile_cmd(message: Message):
-    user_id = message.from_user.id
-    
-    if user_id != OWNER_ID and not db.get_channel_check(user_id):
-        await message.answer("❌ Сначала подпишитесь на канал! /check")
-        return
-    
-    user_data = db.get_user_data(user_id)
-    sub_status = get_sub_status(user_data)
-    
-    text = (
-        f"📊 *Профиль*\n\n"
-        f"💰 Баланс: `{user_data['balance']:.2f} ¢`\n"
-        f"✨ Сила: `{user_data['star_power']}`\n"
-        f"⏳ Урожайность: `{user_data['productivity']:.2f}`\n"
-        f"🎖️ Подписка: {sub_status}\n"
-        f"📢 Канал: `{'✅' if db.get_channel_check(user_id) else '❌'}`\n\n"
-        "⏰ *Кулдауны:*\n"
-    )
-    
-    for cmd in FARM_COMMANDS:
-        cd = db.get_cooldown(user_id, cmd)
-        if cd:
-            text += f"• {cmd}: {format_time(cd)}\n"
-        else:
-            text += f"• {cmd}: ✅ готово\n"
-    
-    keyboard = InlineKeyboardBuilder()
-    keyboard.row(
-        InlineKeyboardButton(text="🛒 Магазин", callback_data="shop"),
-        InlineKeyboardButton(text="🎪 Эвенты", callback_data="events")
-    )
-    
-    is_admin = await is_chat_admin(user_id, message.chat.id)
-    if is_admin and db.check_gold(user_id):
-        keyboard.row(InlineKeyboardButton(text="🚀 Запустить эвент", callback_data="event_start"))
-    
-    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard.as_markup())
-
-@dp.message(Command("shop"))
-async def shop_cmd(message: Message):
-    user_id = message.from_user.id
-    
-    if user_id != OWNER_ID and not db.get_channel_check(user_id):
-        await message.answer("❌ Сначала подпишитесь! /check")
-        return
-    
-    user_data = db.get_user_data(user_id)
-    has_gold = db.check_gold(user_id)
-    
-    text = (
-        "🛒 *Магазин*\n\n"
-        "✨ *Сила звёздности* (100 ¢)\n"
-        "+0.5 ¢ к каждой награде\n\n"
-        "⏳ *Урожайность* (150 ¢)\n"
-        "×1.1 к наградам\n\n"
-        "🎖️ *GOLD подписка* (1500 ¢)\n"
-        "+20% к наградам\n"
-    )
-    
-    if has_gold:
-        text += f"• У вас: {get_sub_status(user_data)}\n"
-    
-    text += f"\n💰 Ваш баланс: `{user_data['balance']:.2f} ¢`"
-    
-    keyboard = InlineKeyboardBuilder()
-    keyboard.row(
-        InlineKeyboardButton(text="✨ Сила +1", callback_data="buy_star"),
-        InlineKeyboardButton(text="⏳ Урожайность", callback_data="buy_prod")
-    )
-    
-    if has_gold:
-        keyboard.row(InlineKeyboardButton(text="🔄 Продлить GOLD", callback_data="buy_gold"))
-    else:
-        keyboard.row(InlineKeyboardButton(text="🎖️ Купить GOLD", callback_data="buy_gold"))
-    
-    keyboard.row(InlineKeyboardButton(text="🔙 Назад", callback_data="profile"))
-    
-    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard.as_markup())
-
-@dp.message(Command("events"))
-async def events_cmd(message: Message):
-    global active_event
-    
-    text = "🎪 *Эвенты*\n\n"
-    
-    if active_event:
-        parts = len(event_participants.get(active_event['id'], []))
-        time_left = format_time(active_event['end_time'])
-        text += (
-            f"🚀 *Активный эвент!*\n"
-            f"🎯 {active_event['type']}\n"
-            f"💰 {active_event['reward']} ¢\n"
-            f"👥 {parts} участников\n"
-            f"⏳ {time_left}\n\n"
-            f"Присоединиться: `/join {active_event['id']}`"
-        )
-    else:
-        text += (
-            "📭 *Нет активных эвентов*\n\n"
-            "✨ *Как запустить:*\n"
-            "1. GOLD подписка\n"
-            "2. Быть админом чата\n"
-            "3. `/event_start`\n\n"
-            "💰 *Награды:* 100-1000 ¢"
-        )
-    
-    await message.answer(text, parse_mode="Markdown")
-
-@dp.message(Command("help"))
-async def help_cmd(message: Message):
-    text = (
-        "❓ *Помощь*\n\n"
-        "🌵 *Фарм команды:*\n"
-        "кактус, ферма, шахта, сад, охота\n"
-        "(кулдаун 2 часа)\n\n"
-        "📋 *Основные команды:*\n"
-        "`/start` - начало\n"
-        "`/profile` - профиль\n"
-        "`/shop` - магазин\n"
-        "`/events` - эвенты\n"
-        "`/check` - подписка на канал\n\n"
-        "🎪 *Эвенты:*\n"
-        "Запускают админы с GOLD\n"
-        "Участвовать может любой\n\n"
-        "🎖️ *GOLD подписка:*\n"
-        "+20% к наградам\n"
-        "1500 ¢ / 30 дней"
-    )
-    await message.answer(text, parse_mode="Markdown")
-
-# =================== ЭВЕНТЫ ===================
-@dp.message(Command("event_start"))
-async def event_start_cmd(message: Message):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-    
-    if user_id != OWNER_ID and not db.get_channel_check(user_id):
-        await message.answer("❌ Сначала подпишитесь! /check")
-        return
-    
-    if not await is_chat_admin(user_id, chat_id):
-        await message.answer("❌ Только админы чата!")
-        return
-    
-    if not db.check_gold(user_id):
-        await message.answer("❌ Нужна GOLD подписка! /shop")
-        return
-    
-    global active_event
-    if active_event:
-        await message.answer("❌ Уже есть активный эвент!")
-        return
-    
-    # Создаем эвент
-    event_types = [("🎯 Обычный", 100, 300), ("🚀 Средний", 300, 600), ("💎 Мега", 600, 1000)]
-    etype, emin, emax = random.choice(event_types)
-    reward = random.randint(emin, emax)
-    event_id = random.randint(1000, 9999)
-    
-    active_event = {
-        'id': event_id,
-        'type': etype,
-        'reward': reward,
-        'end_time': datetime.now() + timedelta(hours=1),
-        'chat_id': chat_id,
-        'creator': user_id
-    }
-    event_participants[event_id] = []
-    
-    text = (
-        f"🎪 *Новый эвент!*\n\n"
-        f"🎯 {etype}\n"
-        f"💰 {reward} ¢\n"
-        f"⏳ 1 час\n"
-        f"🆔 {event_id}\n\n"
-        f"Присоединиться: `/join {event_id}`"
-    )
-    await message.answer(text, parse_mode="Markdown")
-    # Автоматически добавляем создателя
-    event_participants[event_id].append(user_id)
-
 @dp.message(Command("owner_event"))
 async def owner_event_cmd(message: Message):
     if message.from_user.id != OWNER_ID:
@@ -633,9 +928,14 @@ async def owner_event_cmd(message: Message):
         f"💰 {reward} ¢\n"
         f"⏳ 1 час\n"
         f"🆔 {event_id}\n\n"
-        f"Присоединиться: `/join {event_id}`"
+        f"Присоединиться: нажмите кнопку ниже"
     )
-    await message.answer(text, parse_mode="Markdown")
+    
+    keyboard = InlineKeyboardBuilder()
+    keyboard.row(InlineKeyboardButton(text="🎪 Присоединиться", callback_data=f"join_event_{event_id}"))
+    keyboard.row(InlineKeyboardButton(text="📊 Профиль", callback_data="profile"))
+    
+    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard.as_markup())
     event_participants[event_id].append(OWNER_ID)
 
 @dp.message(Command("stop_event"))
@@ -652,47 +952,7 @@ async def stop_event_cmd(message: Message):
     active_event = None
     await message.answer("✅ Эвент остановлен!")
 
-@dp.message(Command("join"))
-async def join_event_cmd(message: Message, command: CommandObject):
-    global active_event
-    
-    if not active_event:
-        await message.answer("❌ Нет активных эвентов!")
-        return
-    
-    if not command.args:
-        await message.answer(f"Использование: `/join {active_event['id']}`")
-        return
-    
-    if int(command.args) != active_event['id']:
-        await message.answer("❌ Неверный ID эвента!")
-        return
-    
-    user_id = message.from_user.id
-    
-    # Проверка чата для обычных админов
-    if active_event['creator'] != OWNER_ID and active_event.get('chat_id') != message.chat.id:
-        await message.answer("❌ Этот эвент в другом чате!")
-        return
-    
-    if user_id in event_participants.get(active_event['id'], []):
-        await message.answer("✅ Вы уже участвуете!")
-        return
-    
-    event_participants[active_event['id']].append(user_id)
-    parts = len(event_participants[active_event['id']])
-    time_left = format_time(active_event['end_time'])
-    
-    await message.answer(
-        f"🎉 *Вы присоединились!*\n\n"
-        f"🎯 {active_event['type']}\n"
-        f"💰 {active_event['reward']} ¢\n"
-        f"👥 {parts} участников\n"
-        f"⏳ {time_left}",
-        parse_mode="Markdown"
-    )
-
-# =================== ФАРМ КОМАНДЫ ===================
+# =================== ФАРМ КОМАНДЫ ТЕКСТОМ ===================
 @dp.message(lambda msg: msg.text and msg.text.lower() in FARM_COMMANDS)
 async def farm_command(message: Message):
     user_id = message.from_user.id
@@ -754,68 +1014,6 @@ async def farm_command(message: Message):
     )
     
     await message.reply(response, parse_mode="Markdown")
-
-# =================== CALLBACK ОБРАБОТЧИКИ ===================
-@dp.callback_query(lambda c: c.data == "start")
-async def start_callback(callback_query: CallbackQuery):
-    await start_cmd(callback_query.message)
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data == "profile")
-async def profile_callback(callback_query: CallbackQuery):
-    await profile_cmd(callback_query.message)
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data == "shop")
-async def shop_callback(callback_query: CallbackQuery):
-    await shop_cmd(callback_query.message)
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data == "events")
-async def events_callback(callback_query: CallbackQuery):
-    await events_cmd(callback_query.message)
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data == "event_start")
-async def event_start_callback(callback_query: CallbackQuery):
-    await event_start_cmd(callback_query.message)
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data in ["buy_star", "buy_prod", "buy_gold"])
-async def buy_callback(callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    user_data = db.get_user_data(user_id)
-    action = callback_query.data
-    
-    if action == "buy_star":
-        if user_data['balance'] >= 100:
-            db.update_balance(user_id, -100)
-            user_data['star_power'] += 1
-            db.save_user_data(user_id, user_data)
-            text = "✅ *Сила звёздности +1!*\n\nТеперь +0.5 ¢ к каждой награде!"
-        else:
-            text = "❌ *Недостаточно средств!*\n\nНужно: 100 ¢"
-    
-    elif action == "buy_prod":
-        if user_data['balance'] >= 150:
-            db.update_balance(user_id, -150)
-            user_data['productivity'] = round(user_data['productivity'] * 1.1, 2)
-            db.save_user_data(user_id, user_data)
-            text = f"✅ *Урожайность увеличена!*\n\nТеперь: `{user_data['productivity']}`"
-        else:
-            text = "❌ *Недостаточно средств!*\n\nНужно: 150 ¢"
-    
-    elif action == "buy_gold":
-        if user_data['balance'] >= 1500:
-            if db.buy_gold(user_id):
-                text = "✅ *GOLD подписка активирована!*\n\n+20% к наградам на 30 дней!"
-            else:
-                text = "❌ Ошибка!"
-        else:
-            text = "❌ *Недостаточно средств!*\n\nНужно: 1500 ¢"
-    
-    await callback_query.message.edit_text(text, parse_mode="Markdown")
-    await callback_query.answer()
 
 # =================== ЗАВЕРШЕНИЕ ЭВЕНТОВ ===================
 async def check_events_task():
